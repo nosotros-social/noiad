@@ -1,0 +1,18 @@
+[package]
+name = "graphey"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# nostr-relay-builder = { git = 'https://github.com/rust-nostr/nostr.git', package = 'nostr-relay-builder' }
+nostr-relay-builder = { path = '../../rust-nostr/crates/nostr-relay-builder', package = 'nostr-relay-builder' }
+nostr-sdk = { path = '../../rust-nostr/crates/nostr-sdk', package = 'nostr-sdk' }
+tokio = { version = "1.46.1", features = ["signal"]}
+tracing-subscriber = "0.3.19"
+nostr-surrealdb = { path = "../nostr-surrealdb" }
+anyhow = "1.0.98"
+serde = "1.0.219"
+serde_json = "1.0.141"
+serde-util = "0.3.1"
+nostr-database = { path = '../../rust-nostr/database/nostr-database', package = 'nostr-database' }
+tracing = "0.1.41"
