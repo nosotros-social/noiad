@@ -50,21 +50,24 @@ impl NostrSurrealDB {
     }
 
     async fn init(&self) -> Result<()> {
-        let query = "
+        let query = r#"
             DEFINE TABLE IF NOT EXISTS event SCHEMAFULL;
-            DEFINE FIELD IF NOT EXISTS id on event type string READONLY;
-            DEFINE FIELD IF NOT EXISTS kind on event type int READONLY;
-            DEFINE FIELD IF NOT EXISTS pubkey on event type string READONLY;
-            DEFINE FIELD IF NOT EXISTS content on event type string READONLY;
-            DEFINE FIELD IF NOT EXISTS created_at on event type int READONLY;
-            DEFINE FIELD IF NOT EXISTS tags on event type array<array<string>> READONLY;
-            DEFINE FIELD IF NOT EXISTS sig on event type string READONLY;
+            DEFINE FIELD IF NOT EXISTS id ON event type string READONLY;
+            DEFINE FIELD IF NOT EXISTS kind ON event type int READONLY;
+            DEFINE FIELD IF NOT EXISTS pubkey ON event type string READONLY;
+            DEFINE FIELD IF NOT EXISTS content ON event type string READONLY;
+            DEFINE FIELD IF NOT EXISTS created_at ON event type int READONLY;
+            DEFINE FIELD IF NOT EXISTS tags ON event type array<array<string>> READONLY;
+            DEFINE FIELD IF NOT EXISTS sig ON event type string READONLY;
+            DEFINE FIELD IF NOT EXISTS tag_pairs ON event TYPE array<string>
+                VALUE tags.map(|$t| array::join([$t[0], $t[1]], ""));
 
             DEFINE INDEX IF NOT EXISTS idx_event_id ON event COLUMNS id UNIQUE;
             DEFINE INDEX IF NOT EXISTS idx_event_kind ON event COLUMNS kind CONCURRENTLY;
             DEFINE INDEX IF NOT EXISTS idx_event_pubkey ON event COLUMNS pubkey CONCURRENTLY;
             DEFINE INDEX IF NOT EXISTS idx_event_created_at ON event COLUMNS created_at CONCURRENTLY;
-        ";
+            DEFINE INDEX IF NOT EXISTS idx_event_tag_pairs ON event COLUMNS tag_pairs;
+        "#;
         self.db.query(query).await?;
         Ok(())
     }
@@ -137,8 +140,26 @@ impl NostrSurrealDB {
 
             response = self
                 .db
-                .query("SELECT * FROM event WHERE id IN $ids")
+                .query("SELECT * FROM event WHERE id IN $ids LIMIT $limit")
                 .bind(("ids", ids))
+                .bind(("limit", limit))
+                .await?
+                .take(0)?;
+        } else if !filter.generic_tags.is_empty() {
+            let tags = filter
+                .generic_tags
+                .iter()
+                .flat_map(|tag| tag.1.iter().map(|t| tag.0.to_string() + t))
+                .collect::<Vec<String>>();
+            response = self
+                .db
+                .query(
+                    r#"
+                    SELECT * FROM event
+                    WHERE array::any($tags, |$t| tag_pairs CONTAINS $t);
+                "#,
+                )
+                .bind(("tags", tags))
                 .await?
                 .take(0)?;
         } else {
@@ -443,23 +464,27 @@ mod test {
         let key2 = Keys::generate();
 
         let build1 = EventBuilder::new(Kind::TextNote, "A")
-            .tags(Tags::from_list(vec![Tag::public_key(key2.public_key)]));
+            .tags(Tags::from_list(vec![Tag::public_key(key2.public_key())]));
 
         let build2 = EventBuilder::new(Kind::TextNote, "B")
-            .tags(Tags::from_list(vec![Tag::public_key(key1.public_key)]));
+            .tags(Tags::from_list(vec![Tag::public_key(key1.public_key())]));
 
         let event1 = db.add_event(&key1, build1).await;
         let event2 = db.add_event(&key2, build2).await;
 
         let res = db
             .db
-            .query(Filter::new().kind(Kind::TextNote).custom_tag(
-                SingleLetterTag::lowercase(Alphabet::P),
-                key1.public_key.to_string(),
-            ))
+            .query(
+                Filter::new()
+                    .kind(Kind::TextNote)
+                    .custom_tag(
+                        SingleLetterTag::lowercase(Alphabet::P),
+                        key1.public_key.to_string(),
+                    )
+                    .limit(1),
+            )
             .await
             .unwrap();
-
         assert_eq!(res.len(), 1);
         assert!(res.contains(&event2));
 
@@ -471,7 +496,6 @@ mod test {
             ))
             .await
             .unwrap();
-
         assert_eq!(res.len(), 1);
         assert!(res.contains(&event1));
     }

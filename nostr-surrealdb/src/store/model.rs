@@ -16,17 +16,31 @@ pub struct EventRecord {
     pub content: String,
     pub sig: String,
     pub tags: Tags,
+    pub tag_pairs: Vec<String>,
     pub created_at: Timestamp,
 }
 
 impl From<Event> for EventRecord {
     fn from(e: Event) -> Self {
+        let tag_pairs = e
+            .tags
+            .iter()
+            .filter_map(|tag| {
+                if let Some(letter) = tag.single_letter_tag()
+                    && let Some(content) = tag.content()
+                {
+                    return Some(letter.to_string() + content);
+                }
+                None
+            })
+            .collect::<Vec<String>>();
         EventRecord {
             id: ("event", e.id.to_string()).into(),
             kind: e.kind,
             pubkey: e.pubkey.to_string(),
             content: e.content,
             tags: e.tags,
+            tag_pairs,
             sig: e.sig.to_string(),
             created_at: e.created_at,
         }
