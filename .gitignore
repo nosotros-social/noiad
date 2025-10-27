@@ -1,8 +1,8 @@
 debug/
 target/
 db
-nostr-surrealdb/nostr_surreal_db
 .DS_Store
 **/*.rs.bk
 *.pdb
 .env
+.sqlx/

@@ -1,0 +1,16 @@
+[package]
+name = "nostrpg"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+nostr-database = "0.43.0"
+nostr-sdk = "0.43.0"
+serde = "1.0.228"
+sqlx = { version = "0.8.6", features = ["json", "postgres", "runtime-tokio-rustls"] }
+tokio = { version = "1.47.1", features = ["tokio-macros"] }
+tracing = "0.1.41"
+
+[dev-dependencies]
+sqlx-cli = "0.8.6"

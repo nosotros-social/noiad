@@ -2,14 +2,15 @@ use nostr_database::nostr::{Event, EventId, Filter, types::Timestamp, util::Boxe
 use nostr_database::{
     Backend, DatabaseError, DatabaseEventStatus, Events, NostrDatabase, SaveEventStatus,
 };
+use std::time::Instant;
 
-pub use store::db::NostrSurrealDB;
-use store::error::Error;
-pub mod store;
+mod store;
 
-impl NostrDatabase for NostrSurrealDB {
+pub use store::db::NostrPg;
+
+impl NostrDatabase for NostrPg {
     fn backend(&self) -> Backend {
-        Backend::Custom("SurrealDB".into())
+        Backend::Custom("Postgres".into())
     }
 
     fn save_event<'a>(
@@ -17,9 +18,20 @@ impl NostrDatabase for NostrSurrealDB {
         event: &'a Event,
     ) -> BoxedFuture<'a, Result<SaveEventStatus, DatabaseError>> {
         Box::pin(async move {
-            self.insert(&event.to_owned())
+            let start = Instant::now();
+            let res = self
+                .insert(&event.to_owned())
                 .await
-                .map_err(|e| DatabaseError::backend(Error::Anyhow(e)))
+                .map_err(DatabaseError::backend);
+            tracing::info!(
+                "New event {} kind {} created_at {} tags: {} in {:?}",
+                &event.id.to_string()[0..10],
+                &event.kind.to_string(),
+                &event.created_at.to_human_datetime(),
+                &event.tags.len(),
+                start.elapsed()
+            );
+            res
         })
     }
 
@@ -31,7 +43,7 @@ impl NostrDatabase for NostrSurrealDB {
             match self
                 .find_event_by_id(event_id)
                 .await
-                .map_err(|e| DatabaseError::backend(Error::Anyhow(e)))?
+                .map_err(DatabaseError::backend)?
             {
                 Some(_) => Ok(DatabaseEventStatus::Saved),
                 None => Ok(DatabaseEventStatus::NotExistent),
@@ -46,24 +58,16 @@ impl NostrDatabase for NostrSurrealDB {
         Box::pin(async move {
             self.find_event_by_id(event_id)
                 .await
-                .map_err(|e| DatabaseError::backend(Error::Anyhow(e)))
+                .map_err(DatabaseError::backend)
         })
     }
 
     fn count(&self, filter: Filter) -> BoxedFuture<Result<usize, DatabaseError>> {
-        Box::pin(async move {
-            self.count(filter)
-                .await
-                .map_err(|e| DatabaseError::backend(Error::Anyhow(e)))
-        })
+        Box::pin(async move { self.count(filter).await.map_err(DatabaseError::backend) })
     }
 
     fn query(&self, filter: Filter) -> BoxedFuture<Result<Events, DatabaseError>> {
-        Box::pin(async move {
-            self.query(filter)
-                .await
-                .map_err(|e| DatabaseError::backend(Error::Anyhow(e)))
-        })
+        Box::pin(async move { self.query(filter).await.map_err(DatabaseError::backend) })
     }
 
     fn negentropy_items(

@@ -1,7 +1,7 @@
 [workspace]
 members = [
     'graphey',
-    'nostr-surrealdb',
+    "nostrpg"
 ]
 default-members = [ 'graphey' ]
 
