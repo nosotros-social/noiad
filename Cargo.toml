@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    'graphey',
+    'relay',
     "nostrpg"
 ]
-default-members = [ 'graphey' ]
+default-members = ['relay']
 
 [workspace.dependencies]
 

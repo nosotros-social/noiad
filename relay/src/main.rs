@@ -1,8 +1,8 @@
 use anyhow::Result;
+use nostrpg::NostrPg;
 use std::env;
 
 use nostr_relay_builder::{LocalRelay, RelayBuilder, builder::RateLimit};
-use nostr_surrealdb::NostrSurrealDB;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -13,9 +13,10 @@ async fn main() -> Result<()> {
         .parse()
         .expect("Invalid `port` value");
 
-    let endpoint = env::var("endpoint").unwrap_or("http://127.0.0.1:8000".into());
+    let database_url = env::var("DATABASE_URL")
+        .unwrap_or("postgres://postgres:postgres@localhost:5432/nostr".into());
 
-    let surreal = NostrSurrealDB::new().open(&endpoint).await?;
+    let database = NostrPg::new(database_url, None).await?;
 
     let rate_limit = RateLimit {
         max_reqs: usize::MAX,
@@ -23,7 +24,8 @@ async fn main() -> Result<()> {
     };
     let builder = RelayBuilder::default()
         .port(port)
-        .database(surreal)
+        .database(database)
+        .max_connections(1000)
         .rate_limit(rate_limit);
     let relay = LocalRelay::run(builder).await?;
 
