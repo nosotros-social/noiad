@@ -7,12 +7,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Waker};
 
-use timely::communication::Push;
-use timely::container::{CapacityContainerBuilder, ContainerBuilder};
-use timely::dataflow::channels::Message;
+use timely::ContainerBuilder;
+use timely::container::CapacityContainerBuilder;
 use timely::dataflow::channels::pact::Pipeline;
-use timely::dataflow::channels::pushers::Tee;
-use timely::dataflow::operators::generic::OutputWrapper;
+use timely::dataflow::channels::pushers::Output;
 use timely::dataflow::operators::generic::builder_rc::OperatorBuilder as TimelyOperatorBuilder;
 use timely::dataflow::operators::{Capability, CapabilitySet};
 use timely::dataflow::{Scope, Stream, StreamCore};
@@ -25,6 +23,7 @@ type InputBuf<T, D> = Rc<RefCell<VecDeque<(T, D)>>>;
 pub struct AsyncOperatorBuilder<G: Scope> {
     builder: TimelyOperatorBuilder<G>,
     input_readers: Vec<Box<dyn FnMut()>>,
+    output_flushes: Vec<Box<dyn FnMut()>>,
     waker_state: Arc<TimelyWaker>,
 }
 
@@ -40,7 +39,8 @@ impl<G: Scope> AsyncOperatorBuilder<G> {
 
         Self {
             builder,
-            input_readers: Vec::new(),
+            input_readers: Default::default(),
+            output_flushes: Default::default(),
             waker_state,
         }
     }
@@ -74,17 +74,22 @@ impl<G: Scope> AsyncOperatorBuilder<G> {
     }
 
     #[allow(clippy::type_complexity)]
-    pub fn new_output<CB: ContainerBuilder>(
+    pub fn new_output<CB>(
         &mut self,
     ) -> (
-        AsyncOutput<G::Timestamp, CB, Tee<G::Timestamp, CB::Container>>,
+        AsyncOutputHandle<G::Timestamp, CB>,
         StreamCore<G, CB::Container>,
-    ) {
-        let (wrapper, stream) = self.builder.new_output();
-        let handler = AsyncOutput {
-            wrapper: Rc::new(RefCell::new(wrapper)),
-        };
-        (handler, stream)
+    )
+    where
+        CB: ContainerBuilder,
+    {
+        let (output, stream) = self.builder.new_output::<CB::Container>();
+        let handle = AsyncOutputHandle::new(output);
+
+        let flush_handle = handle.clone();
+        self.output_flushes
+            .push(Box::new(move || flush_handle.cease()));
+        (handle, stream)
     }
 
     pub fn build<F, Fut>(mut self, logic: F)
@@ -95,6 +100,7 @@ impl<G: Scope> AsyncOperatorBuilder<G> {
         let waker_state = Arc::clone(&self.waker_state);
         let operator_waker = self.waker_state;
         let mut input_readers = std::mem::take(&mut self.input_readers);
+        let mut output_flushes = std::mem::take(&mut self.output_flushes);
 
         self.builder.build_reschedule(move |caps| {
             let mut fut = Some(Box::pin(logic(caps.clone())));
@@ -116,6 +122,9 @@ impl<G: Scope> AsyncOperatorBuilder<G> {
                     {
                         finished = true;
                         fut = None;
+                        for flush in output_flushes.iter_mut() {
+                            (flush)();
+                        }
                     }
                 }
 
@@ -168,28 +177,106 @@ impl<T, D> AsyncInput<T, D> {
     }
 }
 
-pub struct AsyncOutput<T, CB, P>
+pub struct AsyncOutputHandle<T, CB>
 where
     T: Timestamp,
     CB: ContainerBuilder,
-    P: Push<Message<T, CB::Container>> + 'static,
 {
-    wrapper: Rc<RefCell<OutputWrapper<T, CB, P>>>,
+    inner: Rc<RefCell<AsyncOutputInner<T, CB>>>,
 }
 
-impl<T, C, P> AsyncOutput<T, CapacityContainerBuilder<C>, P>
+struct AsyncOutputInner<T, CB>
 where
     T: Timestamp,
-    C: timely::Container + Clone + 'static,
-    P: Push<Message<T, C>>,
+    CB: ContainerBuilder,
 {
+    output: timely::dataflow::channels::pushers::Output<T, CB::Container>,
+    capability: Option<Capability<T>>,
+    builder: CB,
+}
+
+impl<T, CB> AsyncOutputInner<T, CB>
+where
+    T: Timestamp,
+    CB: ContainerBuilder,
+{
+    fn new(output: Output<T, CB::Container>) -> Self {
+        Self {
+            output,
+            capability: None,
+            builder: CB::default(),
+        }
+    }
+
+    fn flush(&mut self) {
+        while let Some(container) = self.builder.finish() {
+            self.output.give(
+                self.capability.as_ref().expect("capability must exist"),
+                container,
+            );
+        }
+    }
+
+    fn cease(&mut self) {
+        self.flush();
+        let _ = self.output.activate();
+        self.capability = None;
+    }
+
+    fn give<D>(&mut self, cap: &Capability<T>, data: D)
+    where
+        CB: container::PushInto<D>,
+    {
+        if let Some(existing) = &self.capability
+            && existing.time() != cap.time()
+        {
+            self.flush();
+            self.capability = None;
+        }
+
+        if self.capability.is_none() {
+            self.capability = Some(cap.clone());
+        }
+
+        self.builder.push_into(data);
+
+        while let Some(container) = self.builder.extract() {
+            self.output.give(
+                self.capability.as_ref().expect("capability must exist"),
+                container,
+            );
+        }
+    }
+}
+
+impl<T, CB> AsyncOutputHandle<T, CB>
+where
+    T: Timestamp,
+    CB: ContainerBuilder,
+{
+    fn new(output: Output<T, CB::Container>) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(AsyncOutputInner::new(output))),
+        }
+    }
+
+    fn cease(&self) {
+        self.inner.borrow_mut().cease();
+    }
+
     pub fn give<D>(&self, cap: &Capability<T>, data: D)
     where
-        CapacityContainerBuilder<C>: container::PushInto<D>,
+        CB: container::PushInto<D>,
     {
-        let mut wrapper = self.wrapper.borrow_mut();
-        let mut handle = wrapper.activate();
-        handle.session(cap).give(data);
+        self.inner.borrow_mut().give(cap, data);
+    }
+}
+
+impl<T: Timestamp, CB: ContainerBuilder> Clone for AsyncOutputHandle<T, CB> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+        }
     }
 }
 
@@ -211,7 +298,7 @@ impl futures_util::task::ArcWake for TimelyWaker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use differential_dataflow::{AsCollection, Collection};
+    use differential_dataflow::AsCollection;
     use timely::dataflow::operators::capture::Extract;
     use timely::dataflow::operators::{Capture, Operator, ToStream};
     use tokio_stream::{StreamExt, iter};
@@ -347,17 +434,21 @@ mod tests {
                 }
             });
 
-            let mapped: Collection<_, u64, isize> = out_stream
-                .unary(Pipeline, "multiply_by_10", |_, _| {
-                    move |input, output| {
-                        while let Some((time, data)) = input.next() {
-                            let mut session = output.session(&time);
-                            for d in data.drain(..) {
-                                session.give((d * 10, *time, 1isize));
-                            }
+            let mapped = out_stream
+                .unary::<CapacityContainerBuilder<Vec<(u64, u64, isize)>>, _, _, _>(
+                    Pipeline,
+                    "multiply_by_10",
+                    move |_, _| {
+                        move |input, output| {
+                            input.for_each(|time, data| {
+                                let mut session = output.session(&time);
+                                for d in data.drain(..) {
+                                    session.give((d * 10, *time.time(), 1isize));
+                                }
+                            });
                         }
-                    }
-                })
+                    },
+                )
                 .as_collection();
 
             mapped.inner.capture()
