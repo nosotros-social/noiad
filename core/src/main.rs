@@ -4,6 +4,7 @@ use core::cli::Cli;
 use core::config::Config;
 use core::event::EdgeLabel;
 use core::operators::top_k::TopK;
+use core::sinks::pagerank_sink::sink_pagerank;
 use core::sources::postgres::render;
 use timely::dataflow::operators::Inspect;
 
@@ -75,6 +76,8 @@ fn main() {
                         tracing::info!("events decoded: {total}");
                     }
                 });
+
+            sink_pagerank(&ranks, config);
         });
     });
 
