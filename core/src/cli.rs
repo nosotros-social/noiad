@@ -5,4 +5,7 @@ use clap::Parser;
 pub struct Cli {
     #[arg(short, long, default_value_t = 4)]
     pub workers: usize,
+
+    #[arg(long, default_value_t = 20)]
+    pub page_rank_iterations: u32,
 }

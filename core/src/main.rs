@@ -1,24 +1,20 @@
 use clap::Parser;
-
-use dotenvy::dotenv;
-
-use differential_dataflow::operators::CountTotal;
+use core::algorithms::pagerank::pagerank;
+use core::cli::Cli;
+use core::config::Config;
+use core::event::EdgeLabel;
+use core::operators::top_k::TopK;
+use core::sources::postgres::render;
 use timely::dataflow::operators::Inspect;
 
-use crate::cli::Cli;
-use crate::config::Config;
-use crate::sources::postgres::render;
-
-pub mod cli;
-pub mod config;
-pub mod errors;
-pub mod operators;
-pub mod sources;
+use differential_dataflow::operators::CountTotal;
+use dotenvy::dotenv;
 
 fn main() {
-    tracing_subscriber::fmt().with_line_number(true).init();
+    tracing_subscriber::fmt().init();
     dotenv().ok();
 
+    let start = std::time::Instant::now();
     let cli = Cli::parse();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(cli.workers)
@@ -40,16 +36,47 @@ fn main() {
                 worker_id: scope.index(),
                 worker_count: scope.peers(),
             };
-            let snapshot_updates = render(scope.clone(), config);
 
-            let total = snapshot_updates.map(|_| ()).count_total();
-            total.inner.inspect(|(((), total), _t, diff)| {
-                if *diff > 0 {
-                    tracing::info!("events decoded: {total}");
-                }
-            });
+            let events = render(scope, config.clone());
+
+            let edges_labels = events
+                .filter(|event| event.kind == 3)
+                .flat_map(|e| e.to_edges());
+
+            let pubkey_edges = edges_labels
+                .filter(|&(_, _, label)| label == EdgeLabel::Pubkey)
+                .map(|(from, to, _)| (from, to));
+
+            let ranks = pagerank(cli.page_rank_iterations, &pubkey_edges).consolidate();
+
+            ranks
+                .count_total()
+                .map(|(node, rank)| (rank, node))
+                .top_k(50)
+                .inspect(|((rank, node), _, _)| {
+                    tracing::info!("top 50 pubkeys: {:?} {:?}", hex::encode(node), rank)
+                });
+
+            edges_labels
+                .map(|_| ())
+                .count_total()
+                .inner
+                .inspect(|(((), total), _t, diff)| {
+                    if *diff > 0 {
+                        tracing::info!("event edges decoded: {total}");
+                    }
+                });
+
+            events
+                .map(|_| ())
+                .count_total()
+                .inspect(|(((), total), _t, diff)| {
+                    if *diff > 0 {
+                        tracing::info!("events decoded: {total}");
+                    }
+                });
         });
     });
 
-    let _ = runtime.block_on(async { tokio::signal::ctrl_c().await });
+    tracing::info!("Completed in {:?}", start.elapsed());
 }

@@ -1,16 +1,14 @@
-use core::event::Event;
+use differential_dataflow::VecCollection;
 use timely::dataflow::Scope;
 
-use differential_dataflow::Collection;
-
-use crate::{config::Config, sources::postgres::snapshot::snapshot};
+use crate::{config::Config, event::EventRow, sources::postgres::snapshot::snapshot};
 
 pub mod connection;
 pub mod parser;
 mod snapshot;
 pub mod utils;
 
-pub fn render<G>(scope: G, config: Config) -> Collection<G, Event, isize>
+pub fn render<G>(scope: &G, config: Config) -> VecCollection<G, EventRow>
 where
     G: Scope<Timestamp = u64>,
 {

@@ -1,22 +1,20 @@
 use std::env;
 
 use anyhow::Error;
+use differential_dataflow::{AsCollection, VecCollection};
 use futures::TryStreamExt;
-
-use core::event::Event;
-
-use differential_dataflow::{AsCollection, Collection};
 use timely::dataflow::channels::pact::Exchange;
 use timely::dataflow::operators::Operator;
 use timely::{container::CapacityContainerBuilder, dataflow::Scope};
 
 use crate::config::Config;
+use crate::event::EventRow;
 use crate::operators::builder_async::AsyncOperatorBuilder;
 use crate::sources::postgres::connection::PostgresConnection;
 use crate::sources::postgres::parser::{CopyParser, quote_ident};
 use crate::sources::postgres::utils::get_publication_info;
 
-pub fn snapshot<G>(scope: G, config: Config) -> Collection<G, Event, isize>
+pub fn snapshot<G>(scope: &G, config: Config) -> VecCollection<G, EventRow>
 where
     G: Scope<Timestamp = u64>,
 {
@@ -35,27 +33,44 @@ where
                     env::var("DB_PUBLICATION").expect("DB_PUBLICATION must be set");
                 let tables = get_publication_info(&client, &db_publication).await?;
 
+                if tables.is_empty() {
+                    panic!(
+                        "No tables found in publication {}. \n\
+                        Create a postgres publication with CREATE PUBLICATION <name> FOR TABLE ...",
+                        db_publication
+                    );
+                }
+
                 for table in tables {
                     client
                         .simple_query("BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ")
                         .await?;
 
+                    let namespace = quote_ident(&table.schema);
+                    let table_name = quote_ident(&table.name);
                     let query = format!(
-                        "COPY {}.{} (id, pubkey, created_at, kind, tags, content) 
-                        TO STDOUT (FORMAT TEXT, DELIMITER '\t')",
-                        quote_ident(&table.schema),
-                        quote_ident(&table.name)
+                        "COPY (
+                            SELECT id, pubkey, created_at, kind, tags 
+                            FROM {namespace}.{table_name}
+                        )
+                        TO STDOUT (FORMAT TEXT, DELIMITER '\t')"
                     );
 
                     let mut stream = std::pin::pin!(client.copy_out_simple(&query).await?);
 
                     let started = std::time::Instant::now();
+                    let mut counter = 0usize;
                     while let Some(bytes) = stream.try_next().await? {
+                        counter += 1;
                         raw_handle.give(&raw_cap[0], bytes.to_vec());
                     }
 
                     client.simple_query("COMMIT").await?;
-                    tracing::info!("Copied completed in {:?}", started.elapsed());
+                    tracing::info!(
+                        "POSTGRES Snapshot completed in {:?} total: {}",
+                        started.elapsed(),
+                        counter
+                    );
                 }
             }
 
@@ -65,21 +80,22 @@ where
 
     // Decode snapshot data in multiple workers
     let mut next_worker = (0..(scope.peers() as u64))
-        .flat_map(|w| std::iter::repeat_n(w, 50))
+        .flat_map(|w| std::iter::repeat_n(w, 1000))
         .cycle();
     let round_robin = Exchange::new(move |_| next_worker.next().unwrap());
 
-    let snapshot_updates: Collection<_, Event, isize> = raw_stream
+    let snapshot_updates: VecCollection<_, EventRow> = raw_stream
         .unary(round_robin, "PgSnapshotDecode", |_, _| {
             move |input, output| {
-                while let Some((time, data)) = input.next() {
+                input.for_each_time(|time, data| {
                     let mut session = output.session(&time);
-                    for bytes in data.drain(..) {
-                        for event in CopyParser::new(&bytes, b'\t').unwrap() {
+                    for bytes in data.flat_map(|data| data.drain(..)) {
+                        let decoder = CopyParser::new(&bytes, b'\t');
+                        for event in decoder.iter_rows() {
                             session.give((event, *time, 1isize));
                         }
                     }
-                }
+                });
             }
         })
         .as_collection();
