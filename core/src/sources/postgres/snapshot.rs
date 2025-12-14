@@ -1,11 +1,15 @@
 use std::env;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Error;
+use anyhow::{Error, Result, anyhow};
 use differential_dataflow::{AsCollection, VecCollection};
 use futures::TryStreamExt;
+use timely::dataflow::Stream;
 use timely::dataflow::channels::pact::Exchange;
 use timely::dataflow::operators::Operator;
 use timely::{container::CapacityContainerBuilder, dataflow::Scope};
+use tokio_postgres::SimpleQueryMessage;
+use tokio_postgres::types::PgLsn;
 
 use crate::config::Config;
 use crate::event::EventRow;
@@ -14,17 +18,18 @@ use crate::sources::postgres::connection::PostgresConnection;
 use crate::sources::postgres::parser::{CopyParser, quote_ident};
 use crate::sources::postgres::utils::get_publication_info;
 
-pub fn snapshot<G>(scope: &G, config: Config) -> VecCollection<G, EventRow>
+pub fn snapshot<G>(scope: &G, config: Config) -> (VecCollection<G, EventRow>, Stream<G, u64>)
 where
     G: Scope<Timestamp = u64>,
 {
     let mut builder = AsyncOperatorBuilder::new("PgSnapshotDataflow".to_string(), scope.clone());
 
     let (raw_handle, raw_stream) = builder.new_output::<CapacityContainerBuilder<Vec<Vec<u8>>>>();
+    let (lsn_handle, lsn_stream) = builder.new_output::<CapacityContainerBuilder<Vec<u64>>>();
 
     let _ = builder.build_fallible(move |capabilities| {
         Box::pin(async move {
-            let [raw_cap]: &mut [_; 1] = capabilities.try_into().unwrap();
+            let [raw_cap, lsn_cap]: &mut [_; 2] = capabilities.try_into().unwrap();
 
             let is_snapshot_leader = config.worker_id == 0;
             if is_snapshot_leader {
@@ -41,11 +46,12 @@ where
                     );
                 }
 
-                for table in tables {
-                    client
-                        .simple_query("BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ")
-                        .await?;
+                let replication_client =
+                    PostgresConnection::from_env().connect_replication().await?;
+                let snapshot_lsn = export_snapshot(&replication_client, config.worker_id).await?;
+                lsn_handle.give(&lsn_cap[0], snapshot_lsn);
 
+                for table in tables {
                     let namespace = quote_ident(&table.schema);
                     let table_name = quote_ident(&table.name);
                     let query = format!(
@@ -100,5 +106,49 @@ where
         })
         .as_collection();
 
-    snapshot_updates
+    (snapshot_updates, lsn_stream)
+}
+
+fn build_tmp_slot_name(worker_id: usize) -> Result<String> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    Ok(format!("slot_{worker_id}_{now}"))
+}
+
+async fn export_snapshot(client: &tokio_postgres::Client, worker_id: usize) -> Result<u64> {
+    match export_snapshot_inner(client, worker_id).await {
+        Ok(lsn) => Ok(lsn),
+        Err(e) => {
+            client.simple_query("ROLLBACK;").await?;
+            panic!("{:?}", e)
+        }
+    }
+}
+
+async fn export_snapshot_inner(client: &tokio_postgres::Client, worker_id: usize) -> Result<u64> {
+    client
+        .simple_query("BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ;")
+        .await?;
+
+    let slot = build_tmp_slot_name(worker_id)?;
+    let query = format!(
+        "CREATE_REPLICATION_SLOT {} TEMPORARY LOGICAL \"pgoutput\" USE_SNAPSHOT",
+        slot
+    );
+
+    let mut consistent_point: Option<PgLsn> = None;
+    for msg in client.simple_query(&query).await? {
+        if let SimpleQueryMessage::Row(row) = msg {
+            consistent_point = Some(row.get("consistent_point").unwrap().parse().unwrap());
+            break;
+        }
+    }
+
+    let consistent_point = consistent_point
+        .ok_or_else(|| anyhow!("CREATE_REPLICATION_SLOT returned no row with consistent_point"))?;
+
+    let snapshot_lsn = u64::from(consistent_point)
+        .checked_sub(1)
+        .ok_or_else(|| anyhow!("consistent_point was zero"))?;
+
+    Ok(snapshot_lsn)
 }

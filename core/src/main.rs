@@ -79,6 +79,8 @@ fn main() {
 
             sink_pagerank(&ranks, config);
         });
+
+        while worker.step_or_park(None) {}
     });
 
     tracing::info!("Completed in {:?}", start.elapsed());
