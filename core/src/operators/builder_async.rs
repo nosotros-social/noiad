@@ -11,7 +11,7 @@ use std::task::{Context, Poll, Waker, ready};
 
 use futures_util::Stream;
 
-use timely::communication::Pull;
+use timely::communication::{Pull, Push};
 use timely::container::CapacityContainerBuilder;
 use timely::container::PushInto;
 use timely::dataflow::channels::Message;
@@ -23,32 +23,41 @@ use timely::dataflow::operators::{Capability, CapabilitySet, InputCapability};
 use timely::dataflow::{Scope, StreamCore};
 use timely::progress::{Antichain, Timestamp};
 use timely::scheduling::SyncActivator;
-use timely::{Container, ContainerBuilder, PartialOrder};
+use timely::{Bincode, Container, ContainerBuilder, PartialOrder};
 
 pub struct AsyncOperatorBuilder<G: Scope> {
     builder: TimelyOperatorBuilder<G>,
     input_frontiers: Vec<Antichain<G::Timestamp>>,
+    operator_waker: Arc<TimelyWaker>,
     output_flushes: Vec<Box<dyn FnMut()>>,
     input_queues: Vec<Box<dyn InputQueue<G::Timestamp>>>,
-    waker_state: Arc<TimelyWaker>,
+    /// A handle to check whether all workers have pressed the shutdown button.
+    shutdown_handle: ButtonHandle,
+    /// A button to coordinate shutdown of this operator among workers.
+    shutdown_button: Button,
 }
 
 impl<G: Scope> AsyncOperatorBuilder<G> {
-    pub fn new(name: String, scope: G) -> Self {
+    pub fn new(name: String, mut scope: G) -> Self {
         let builder = TimelyOperatorBuilder::new(name, scope.clone());
         let info = builder.operator_info();
-        let waker_state = Arc::new(TimelyWaker {
-            activator: scope.sync_activator_for(info.address.to_vec()),
+        let sync_activator = scope.sync_activator_for(info.address.to_vec());
+        let operator_waker = TimelyWaker {
+            activator: sync_activator,
             active: AtomicBool::new(false),
             task_ready: AtomicBool::new(true),
-        });
+        };
+
+        let (shutdown_handle, shutdown_button) = button(&mut scope, info.address);
 
         Self {
             builder,
+            operator_waker: Arc::new(operator_waker),
             input_frontiers: Default::default(),
             output_flushes: Default::default(),
             input_queues: Default::default(),
-            waker_state,
+            shutdown_handle,
+            shutdown_button,
         }
     }
 
@@ -160,22 +169,19 @@ impl<G: Scope> AsyncOperatorBuilder<G> {
         (handle, stream)
     }
 
-    pub fn build<F, Fut>(mut self, logic: F)
+    pub fn build<F, Fut>(self, logic: F) -> Button
     where
         F: FnOnce(Vec<Capability<G::Timestamp>>) -> Fut + 'static,
         Fut: Future<Output = ()> + 'static,
     {
-        let waker_state = Arc::clone(&self.waker_state);
-        let operator_waker = self.waker_state;
+        let operator_waker = self.operator_waker;
         let mut input_frontiers = self.input_frontiers;
         let mut input_queues = self.input_queues;
-        let mut output_flushes = std::mem::take(&mut self.output_flushes);
+        let mut output_flushes = self.output_flushes;
+        let mut shutdown_handle = self.shutdown_handle;
 
         self.builder.build_reschedule(move |caps| {
-            let mut fut = Some(Box::pin(logic(caps.clone())));
-            let mut finished = false;
-            let waker_state = Arc::clone(&waker_state);
-
+            let mut logic_fut = Some(Box::pin(logic(caps)));
             move |new_frontiers| {
                 operator_waker.active.store(true, Ordering::SeqCst);
                 for (i, queue) in input_queues.iter_mut().enumerate() {
@@ -190,26 +196,56 @@ impl<G: Scope> AsyncOperatorBuilder<G> {
                     // messages with progress tracking.
                     queue.accept_input();
                 }
-
                 operator_waker.active.store(false, Ordering::SeqCst);
 
-                if !finished && waker_state.task_ready.swap(false, Ordering::SeqCst) {
-                    let waker = futures_util::task::waker_ref(&waker_state);
-                    let mut cx = Context::from_waker(&waker);
-                    if let Some(f) = fut.as_mut()
-                        && Pin::new(f).poll(&mut cx).is_ready()
+                // If our worker pressed the button we stop scheduling the logic future and/or
+                // draining the input handles to stop producing data and frontier updates
+                // downstream.
+                if shutdown_handle.local_pressed() {
+                    // When all workers press their buttons we drop the logic future and start
+                    // draining the input handles.
+                    if shutdown_handle.all_pressed() {
+                        logic_fut = None;
+                        for queue in input_queues.iter_mut() {
+                            queue.drain_input();
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    // Schedule the logic future if any of the wakers above marked the task as ready
+                    if let Some(fut) = logic_fut.as_mut()
+                        && operator_waker.task_ready.load(Ordering::SeqCst)
                     {
-                        finished = true;
-                        fut = None;
+                        let waker = futures_util::task::waker_ref(&operator_waker);
+                        let mut cx = Context::from_waker(&waker);
+                        operator_waker.task_ready.store(false, Ordering::SeqCst);
+                        if Pin::new(fut).poll(&mut cx).is_ready() {
+                            // We're done with logic so deallocate the task
+                            logic_fut = None;
+                        }
+                        // Flush all the outputs before exiting
                         for flush in output_flushes.iter_mut() {
                             (flush)();
                         }
                     }
-                }
 
-                !finished
+                    // The timely operator needs to be kept alive if the task is pending
+                    if logic_fut.is_some() {
+                        true
+                    } else {
+                        // Othewise we should keep draining all inputs
+                        for queue in input_queues.iter_mut() {
+                            queue.drain_input();
+                        }
+                        false
+                    }
+                }
             }
         });
+
+        self.shutdown_button
     }
 
     pub fn build_fallible<F, E: 'static>(mut self, logic: F) -> StreamCore<G, Vec<Rc<E>>>
@@ -291,18 +327,18 @@ impl<T: Timestamp, D: Container, C: InputConnection<T>> Stream for AsyncInputHan
 }
 
 /// Shared part of an async output handle
-struct AsyncOutputHandleInner<T: Timestamp, CB: ContainerBuilder> {
+pub struct AsyncOutputHandleInner<T: Timestamp, CB: ContainerBuilder> {
     /// Handle to write to the output stream.
-    output: Output<T, CB::Container>,
+    pub output: Output<T, CB::Container>,
     /// Current capability held by this output handle.
-    capability: Option<Capability<T>>,
+    pub capability: Option<Capability<T>>,
     /// Container builder to accumulate data before sending at `capability`.
-    builder: CB,
+    pub builder: CB,
 }
 
 impl<T: Timestamp, CB: ContainerBuilder> AsyncOutputHandleInner<T, CB> {
     /// Write all pending data to the output stream.
-    fn flush(&mut self) {
+    pub fn flush(&mut self) {
         while let Some(container) = self.builder.finish() {
             self.output
                 .give(self.capability.as_ref().expect("must exist"), container);
@@ -310,7 +346,7 @@ impl<T: Timestamp, CB: ContainerBuilder> AsyncOutputHandleInner<T, CB> {
     }
 
     /// Cease this output handle, flushing all pending data and releasing its capability.
-    fn cease(&mut self) {
+    pub fn cease(&mut self) {
         self.flush();
         let _ = self.output.activate();
         self.capability = None;
@@ -341,7 +377,7 @@ impl<T: Timestamp, CB: ContainerBuilder> AsyncOutputHandleInner<T, CB> {
 }
 
 pub struct AsyncOutputHandle<T: Timestamp, CB: ContainerBuilder> {
-    inner: Rc<RefCell<AsyncOutputHandleInner<T, CB>>>,
+    pub inner: Rc<RefCell<AsyncOutputHandleInner<T, CB>>>,
     index: usize,
 }
 
@@ -375,7 +411,7 @@ where
         }
     }
 
-    fn cease(&self) {
+    pub fn cease(&self) {
         self.inner.borrow_mut().cease();
     }
 }
@@ -550,6 +586,7 @@ struct InputHandleQueue<
     C: InputConnection<T>,
     P: Pull<Message<T, D>> + 'static,
 > {
+    #[allow(clippy::type_complexity)]
     queue: Rc<RefCell<VecDeque<Event<T, C::Capability, D>>>>,
     waker: Rc<Cell<Option<Waker>>>,
     connection: C,
@@ -568,6 +605,81 @@ impl futures_util::task::ArcWake for TimelyWaker {
         if !this.active.load(Ordering::SeqCst) {
             let _ = this.activator.activate();
         }
+    }
+}
+
+/// Creates a new coordinated button the worker configuration described by `scope`.
+pub fn button<G: Scope>(scope: &mut G, addr: Rc<[usize]>) -> (ButtonHandle, Button) {
+    let index = scope.new_identifier();
+    let (pushers, puller) = scope.allocate(index, addr);
+
+    let local_pressed = Rc::new(Cell::new(false));
+
+    let handle = ButtonHandle {
+        buttons_remaining: scope.peers(),
+        local_pressed: Rc::clone(&local_pressed),
+        puller,
+    };
+
+    let token = Button {
+        pushers,
+        local_pressed,
+    };
+
+    (handle, token)
+}
+
+/// A button that can be used to coordinate an action after all workers have pressed it.
+pub struct ButtonHandle {
+    /// The number of buttons still unpressed among workers.
+    buttons_remaining: usize,
+    /// A flag indicating whether this worker has pressed its button.
+    local_pressed: Rc<Cell<bool>>,
+    puller: Box<dyn Pull<Bincode<bool>>>,
+}
+
+impl ButtonHandle {
+    /// Returns whether this worker has pressed its button.
+    pub fn local_pressed(&self) -> bool {
+        self.local_pressed.get()
+    }
+
+    /// Returns whether all workers have pressed their buttons.
+    pub fn all_pressed(&mut self) -> bool {
+        while self.puller.recv().is_some() {
+            self.buttons_remaining -= 1;
+        }
+        self.buttons_remaining == 0
+    }
+}
+
+pub struct Button {
+    pushers: Vec<Box<dyn Push<Bincode<bool>>>>,
+    local_pressed: Rc<Cell<bool>>,
+}
+
+impl Button {
+    /// Presses the button. It is safe to call this function multiple times.
+    pub fn press(&mut self) {
+        for mut pusher in self.pushers.drain(..) {
+            pusher.send(Bincode::from(true));
+            pusher.done();
+        }
+        self.local_pressed.set(true);
+    }
+
+    /// Converts this button into a deadman's switch that will automatically press the button when
+    /// dropped.
+    pub fn press_on_drop(self) -> PressOnDropButton {
+        PressOnDropButton(self)
+    }
+}
+
+pub struct PressOnDropButton(Button);
+
+impl Drop for PressOnDropButton {
+    fn drop(&mut self) {
+        self.0.press();
     }
 }
 
