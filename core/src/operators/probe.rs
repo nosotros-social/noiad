@@ -1,0 +1,270 @@
+// https://github.com/MaterializeInc/materialize/blob/main/src/timely-util/src/probe.rs
+use std::cell::RefCell;
+use std::convert::Infallible;
+use std::rc::Rc;
+
+use timely::container::CapacityContainerBuilder;
+use timely::dataflow::operators::{CapabilitySet, InspectCore};
+use timely::dataflow::{Scope, Stream, StreamCore};
+use timely::progress::Timestamp;
+use timely::progress::frontier::{Antichain, AntichainRef, MutableAntichain};
+use timely::scheduling::Activator;
+use timely::{Container, Data, PartialOrder};
+use tokio::sync::Notify;
+
+use crate::operators::builder_async::AsyncOperatorBuilder;
+
+/// Monitors progress at a `StreamCore`.
+pub trait ProbeNotify<G: Scope> {
+    fn probe_notify_with(&self, handles: Vec<Handle<G::Timestamp>>) -> Self;
+}
+
+impl<G, C> ProbeNotify<G> for StreamCore<G, C>
+where
+    G: Scope,
+    C: Container + Data,
+{
+    fn probe_notify_with(&self, mut handles: Vec<Handle<G::Timestamp>>) -> Self {
+        if handles.is_empty() {
+            return self.clone();
+        }
+
+        for handle in &mut handles {
+            handle.update_frontier(&[<G::Timestamp as Timestamp>::minimum()]);
+        }
+
+        self.inspect_container(move |update| {
+            if let Err(frontier) = update {
+                for handle in &mut handles {
+                    handle.update_frontier(frontier);
+                }
+            }
+        })
+    }
+}
+
+/// Minimal progress handle used to drive `probe_source`.
+#[derive(Debug)]
+pub struct Handle<T: Timestamp> {
+    /// The overall shared frontier managed by all the handles
+    frontier: Rc<RefCell<MutableAntichain<T>>>,
+    /// The private frontier containing the changes produced by this handle only
+    handle_frontier: Antichain<T>,
+    notify: Rc<Notify>,
+    /// Activators to notify when the frontier progresses
+    activators: Rc<RefCell<Vec<Activator>>>,
+}
+
+impl<T: Timestamp> Default for Handle<T> {
+    fn default() -> Self {
+        // Initialize the handle frontier to the empty frontier, to prevent it from unintentionally
+        // holding back the global frontier. Only when a handle is used to probe a stream do we
+        // reset its frontier to the minimal one.
+        Handle {
+            frontier: Rc::new(RefCell::new(MutableAntichain::new())),
+            handle_frontier: Antichain::new(),
+            notify: Rc::new(Notify::new()),
+            activators: Rc::default(),
+        }
+    }
+}
+
+impl<T: Timestamp> Handle<T> {
+    /// Wait for the frontier monitored by this probe to progress
+    pub async fn progressed(&self) {
+        self.notify.notified().await
+    }
+
+    /// Returns true iff the frontier is strictly less than `time`.
+    #[inline]
+    pub fn less_than(&self, time: &T) -> bool {
+        self.frontier.borrow().less_than(time)
+    }
+    /// Returns true iff the frontier is less than or equal to `time`.
+    #[inline]
+    pub fn less_equal(&self, time: &T) -> bool {
+        self.frontier.borrow().less_equal(time)
+    }
+    /// Returns true iff the frontier is empty.
+    #[inline]
+    pub fn done(&self) -> bool {
+        self.frontier.borrow().is_empty()
+    }
+
+    /// Invokes a method on the frontier, returning its result.
+    ///
+    /// This method allows inspection of the frontier, which cannot be returned by reference as
+    /// it is on the other side of a `RefCell`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mz_timely_util::probe::Handle;
+    ///
+    /// let handle = Handle::<usize>::default();
+    /// let frontier = handle.with_frontier(|frontier| frontier.to_vec());
+    /// ```
+    #[inline]
+    pub fn with_frontier<R, F: FnMut(AntichainRef<T>) -> R>(&self, mut function: F) -> R {
+        function(self.frontier.borrow().frontier())
+    }
+
+    #[inline]
+    fn update_frontier(&mut self, new_frontier: &[T]) {
+        let mut frontier = self.frontier.borrow_mut();
+        let changes = frontier.update_iter(
+            self.handle_frontier
+                .iter()
+                .map(|t| (t.clone(), -1))
+                .chain(new_frontier.iter().map(|t| (t.clone(), 1))),
+        );
+        self.handle_frontier.clear();
+        self.handle_frontier.extend(new_frontier.iter().cloned());
+        if changes.count() > 0 {
+            self.notify.notify_waiters();
+            for activator in self.activators.borrow().iter() {
+                activator.activate();
+            }
+        }
+    }
+
+    /// Register an activator to be notified when the frontier progresses
+    pub fn activate(&self, activator: Activator) {
+        self.activators.borrow_mut().push(activator);
+    }
+}
+
+impl<T: Timestamp> Clone for Handle<T> {
+    fn clone(&self) -> Self {
+        Handle {
+            frontier: Rc::clone(&self.frontier),
+            handle_frontier: Antichain::new(),
+            notify: Rc::clone(&self.notify),
+            activators: Rc::clone(&self.activators),
+        }
+    }
+}
+
+pub fn probe_source<G, T>(scope: G, name: String, handle: Handle<T>) -> Stream<G, Infallible>
+where
+    G: Scope<Timestamp = T>,
+    T: Timestamp,
+{
+    let mut builder = AsyncOperatorBuilder::new(name, scope);
+    let (_output, output_stream) = builder.new_output::<CapacityContainerBuilder<_>>();
+
+    builder.build(move |capabilities| async move {
+        let mut cap_set = CapabilitySet::from(capabilities);
+        let mut frontier = Antichain::from_elem(T::minimum());
+
+        let mut downgrade_capability = |f: AntichainRef<T>| {
+            if PartialOrder::less_than(&frontier.borrow(), &f) {
+                frontier = f.to_owned();
+                cap_set.downgrade(&f);
+            }
+            !frontier.is_empty()
+        };
+
+        while handle.with_frontier(&mut downgrade_capability) {
+            handle.progressed().await;
+        }
+    });
+
+    output_stream
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use timely::progress::Timestamp;
+
+    #[test]
+    fn assert_multiple_probe_handles_frontiers() {
+        let mut handle_a = Handle::<usize>::default();
+        let mut handle_b = handle_a.clone();
+
+        // assert initial frontier
+        handle_a.update_frontier(&[<usize as Timestamp>::minimum()]);
+        handle_b.update_frontier(&[<usize as Timestamp>::minimum()]);
+        assert_eq!(handle_a.with_frontier(|f| f.to_vec()), vec![0]);
+        assert_eq!(handle_b.with_frontier(|f| f.to_vec()), vec![0]);
+
+        // advance only handle_a, both are 0 because handle_b is still at 0
+        handle_a.update_frontier(&[5]);
+        assert_eq!(handle_a.with_frontier(|f| f.to_vec()), vec![0]);
+        assert_eq!(handle_b.with_frontier(|f| f.to_vec()), vec![0]);
+
+        // advance handle_b, now both can advance to 5
+        handle_b.update_frontier(&[5]);
+        assert_eq!(handle_a.with_frontier(|f| f.to_vec()), vec![5]);
+        assert_eq!(handle_b.with_frontier(|f| f.to_vec()), vec![5]);
+
+        // close handle_a, both remain at 5 because handle_b is still at 5
+        handle_a.update_frontier(&[]);
+        assert_eq!(handle_a.with_frontier(|f| f.to_vec()), vec![5]);
+        assert_eq!(handle_b.with_frontier(|f| f.to_vec()), vec![5]);
+
+        // close handle_b, both are done
+        handle_b.update_frontier(&[]);
+        assert!(handle_a.done());
+        assert!(handle_b.done());
+    }
+
+    #[test]
+    fn assert_probe_notify_with() {
+        use timely::dataflow::operators::ToStream;
+
+        timely::execute::execute_directly(|worker| {
+            let handle = Handle::<usize>::default();
+            let handle_clone = handle.clone();
+
+            assert!(handle.with_frontier(|f| f.is_empty()));
+
+            worker.dataflow::<usize, _, _>(|scope| {
+                vec![1u64, 2, 3]
+                    .to_stream(scope)
+                    .probe_notify_with(vec![handle_clone]);
+            });
+
+            worker.step();
+            assert_eq!(handle.with_frontier(|f| f.to_vec()), vec![0]);
+
+            while !handle.done() {
+                worker.step();
+            }
+
+            assert!(handle.with_frontier(|f| f.is_empty()));
+            assert!(handle.done());
+        });
+    }
+
+    #[tokio::test]
+    async fn assert_progressed() {
+        use tokio::task::LocalSet;
+
+        let local = LocalSet::new();
+
+        local
+            .run_until(async {
+                let mut handle = Handle::<usize>::default();
+                let waiter_handle = handle.clone();
+
+                handle.update_frontier(&[0]);
+
+                let waiter = tokio::task::spawn_local(async move {
+                    waiter_handle.progressed().await;
+                });
+
+                tokio::task::yield_now().await;
+
+                handle.update_frontier(&[5]);
+
+                tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
+                    .await
+                    .expect("waiter should complete after frontier change")
+                    .unwrap();
+            })
+            .await;
+    }
+}
