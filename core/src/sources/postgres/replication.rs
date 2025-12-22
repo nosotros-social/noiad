@@ -18,8 +18,9 @@ use postgres_replication::protocol::{LogicalReplicationMessage, ReplicationMessa
 use tokio_postgres::types::PgLsn;
 
 use crate::config::Config;
-use crate::event::{EventRow, Kind, Tags};
+use crate::event::{EventRow, Tags};
 use crate::operators::builder_async::{AsyncOperatorBuilder, Event};
+use crate::operators::probe::Handle;
 use crate::sources::postgres::connection::PostgresConnection;
 use crate::types::Diff;
 
@@ -33,6 +34,7 @@ pub fn replication<G>(
     scope: &G,
     config: Config,
     lsn_stream: &Stream<G, u64>,
+    probe: &Handle<u64>,
 ) -> VecCollection<G, EventRow, Diff>
 where
     G: Scope<Timestamp = u64>,
@@ -43,6 +45,8 @@ where
         builder.new_output::<CapacityContainerBuilder<Vec<(EventParts, u64, Diff)>>>();
 
     let mut lsn_input = builder.new_disconnected_input(lsn_stream, Pipeline);
+
+    let probe = probe.clone();
 
     let _ = builder.build_fallible(move |capabilities| {
         Box::pin(async move {
@@ -63,7 +67,6 @@ where
             ensure_replication_slot(&replication_client, &slot).await.unwrap();
 
             let mut resume_lsn_u64 = 0u64;
-
             while let Some(event) = lsn_input.next().await {
                 match event {
                     Event::Data(_, data) => {
@@ -92,8 +95,8 @@ where
             let logical_stream = LogicalReplicationStream::new(copy_stream);
             let mut logical_stream = std::pin::pin!(logical_stream);
 
-            let mut feedback_timer = tokio::time::interval(Duration::from_secs(1));
-            feedback_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut keepalive_timer = tokio::time::interval(Duration::from_secs(1));
+            keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             let mut commit_lsn_u64: Option<u64> = None;
             let mut data_upper = resume_lsn_u64;
@@ -104,9 +107,46 @@ where
                 publication
             );
 
+            let mut total_inserted = 0;
+            let mut total_deleted = 0;
+
+            let mut current_round = resume_lsn_u64;
+            let mut last_flushed_round: Option<u64> = None;
+
+            let mut pending: Vec<(EventParts, Diff)> = Vec::new();
+            let mut pending_flush = false;
+
+            // Let the initial capability from snapshot through
+            raw_cap.downgrade([current_round]);
+
             loop {
+                let at_capacity = pending.len() >= config.replication_max_pending;
+                let downstream_ready = match last_flushed_round {
+                    None => true, 
+                    Some(prev) => probe.with_frontier(|f| !f.less_equal(&prev)),
+                };
+                if pending_flush && downstream_ready && !pending.is_empty() {
+                    tracing::info!(
+                        "flushing round {} ({} events) -> next round {}",
+                        current_round,
+                        pending.len(),
+                        data_upper,
+                    );
+
+                    for (parts, diff) in pending.drain(..) {
+                        raw_handle.give(&raw_cap[0], (parts, current_round, diff));
+                    }
+
+                    last_flushed_round = Some(current_round);
+                    current_round = data_upper;
+                    raw_cap.downgrade([current_round]);
+                    pending_flush = false;
+                }
+
                 tokio::select! {
-                    _ = feedback_timer.tick() => {
+                    biased;
+
+                    _ = keepalive_timer.tick() => {
                         let ts: i64 = PG_EPOCH.elapsed().unwrap().as_micros().try_into().unwrap();
                         let lsn = PgLsn::from(data_upper);
                         logical_stream
@@ -115,7 +155,9 @@ where
                             .await?;
                     },
 
-                    Some(message) = logical_stream.next() => {
+                    _ = probe.progressed(), if at_capacity => {},
+
+                    Some(message) = logical_stream.next(), if !at_capacity => {
                         match message {
                             Ok(ReplicationMessage::XLogData(xlog)) => {
                                 let logical = xlog.into_data();
@@ -123,32 +165,45 @@ where
                                 match logical {
                                     LogicalReplicationMessage::Relation(_) => {}
                                     LogicalReplicationMessage::Begin(begin) => {
-                                        let lsn = begin.final_lsn();
-                                        commit_lsn_u64 = Some(lsn);
+                                        commit_lsn_u64 = Some(begin.final_lsn());
                                     }
-
                                     LogicalReplicationMessage::Commit(_) => {
                                         if let Some(lsn) = commit_lsn_u64.take() {
                                             data_upper = lsn + 1;
-                                            raw_cap.downgrade([&data_upper]);
+                                            pending_flush = true;
+                                            tracing::info!(
+                                                "Worker {}] replication commit (inserted: {}, deleted: {}, LSN: {})",
+                                                config.worker_id,
+                                                total_inserted,
+                                                total_deleted,
+                                                lsn
+                                            );
+                                            total_inserted = 0;
+                                            total_deleted = 0;
                                         }
                                     }
                                     LogicalReplicationMessage::Insert(insert) => {
-                                        let Some(lsn) = commit_lsn_u64 else { continue };
+                                        if  commit_lsn_u64.is_none() {
+                                            continue
+                                        };
                                         let Some(parts) = EventParts::from_tuple_fixed(insert.tuple().tuple_data()) else {
                                             continue
                                         };
 
-                                        raw_handle.give(&raw_cap[0], (parts, lsn, ONE));
+                                        total_inserted += 1;
+                                        pending.push((parts, ONE));
                                     }
                                     LogicalReplicationMessage::Delete(delete) => {
-                                        let Some(lsn) = commit_lsn_u64 else { continue };
+                                        if  commit_lsn_u64.is_none() {
+                                            continue
+                                        };
                                         let Some(old) = delete.old_tuple() else { continue };
                                         let Some(parts) = EventParts::from_tuple_fixed(old.tuple_data()) else {
                                             continue
                                         };
 
-                                        raw_handle.give(&raw_cap[0], (parts, lsn, MINUS_ONE));
+                                        total_deleted += 1;
+                                        pending.push((parts, MINUS_ONE));
                                     }
                                     LogicalReplicationMessage::Update(_) => {}
                                     _ => {}
@@ -159,7 +214,6 @@ where
                                 let wal_end: u64 = keepalive.wal_end();
                                 if wal_end > data_upper {
                                     data_upper = wal_end;
-                                    raw_cap.downgrade([&data_upper]);
                                 }
                             }
 
@@ -212,7 +266,7 @@ where
         .as_collection()
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 struct EventParts {
     id: Vec<u8>,
     pubkey: Vec<u8>,
@@ -266,8 +320,7 @@ impl TryFrom<EventParts> for EventRow {
         let created_at = parts.created_at_u64()?;
 
         let kind_value = parts.kind_u16()?;
-        let kind =
-            Kind::try_from(kind_value).map_err(|_| anyhow!("unknown kind {}", kind_value))?;
+        let kind = nostr_sdk::Kind::from_u16(kind_value);
         let tags = Tags::parse_from_bytes(&parts.tags);
 
         Ok(EventRow {
