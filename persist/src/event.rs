@@ -1,23 +1,26 @@
 use anyhow::Result;
-use rkyv::rancor;
-use rkyv::{Archive, Deserialize, Serialize, from_bytes, to_bytes};
+use rkyv::{Archive, from_bytes, to_bytes};
+use rkyv::{Deserialize, Serialize, rancor};
 use rocksdb::{DBIteratorWithThreadMode, DBWithThreadMode, MultiThreaded};
+use types::event::{Edge, EventRaw, EventRow};
 
 use crate::db::PersistStore;
-use crate::edges::Edge;
+use crate::edges::EdgeIterator;
 use crate::interner::InternBatch;
+use crate::query::PersistQuery;
 use crate::schema::{EVENTS, EVENTS_BY_PUBKEY, cf};
+use crate::tag::EventTag;
 
 #[derive(Archive, Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Event {
+pub struct EventRecord {
     pub id: u32,
     pub pubkey: u32,
     pub kind: u16,
     pub created_at: u64,
-    pub tags: Vec<Edge>,
+    pub tags: Vec<EventTag>,
 }
 
-impl Event {
+impl EventRecord {
     pub fn key(&self) -> [u8; 4] {
         self.id.to_be_bytes()
     }
@@ -47,7 +50,7 @@ impl Event {
 
     pub fn d_tag(&self) -> Option<u32> {
         self.tags.iter().find_map(|e| match e {
-            Edge::DTag(d) => Some(*d),
+            EventTag::DTag(d) => Some(*d),
             _ => None,
         })
     }
@@ -55,60 +58,79 @@ impl Event {
 
 pub struct EventIterator<'a> {
     iter: DBIteratorWithThreadMode<'a, DBWithThreadMode<MultiThreaded>>,
+    query: PersistQuery<EventRow>,
 }
 
 impl<'a> Iterator for EventIterator<'a> {
-    type Item = Result<Event>;
+    type Item = EventRow;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|item| {
-            let (_, value_bytes) = item?;
-            let event = from_bytes::<Event, rancor::Error>(&value_bytes)?;
-            Ok(event)
+        self.iter.by_ref().find_map(|result| {
+            let (_, value_bytes) = result.ok()?;
+            let archived = unsafe { rkyv::access_unchecked::<ArchivedEventRecord>(&value_bytes) };
+
+            let kind = archived.kind.to_native();
+            if let Some(kinds) = &self.query.kinds
+                && !kinds.contains(&kind)
+            {
+                return None;
+            }
+
+            Some(EventRow {
+                id: archived.id.to_native(),
+                pubkey: archived.pubkey.to_native(),
+                kind,
+                created_at: archived.created_at.to_native(),
+            })
         })
     }
 }
 
-#[derive(Clone)]
-pub struct RawEventData {
-    pub id: [u8; 32],
-    pub pubkey: [u8; 32],
-    pub created_at: u64,
-    pub kind: u16,
-    pub tags_json: Vec<u8>,
-}
-
 impl PersistStore {
-    pub fn get_event(&self, id: u32) -> Result<Option<Event>> {
+    pub fn get_event(&self, id: u32) -> Result<Option<EventRecord>> {
         let cf_events = cf!(self.db, EVENTS);
         self.db
             .get_cf(&cf_events, id.to_be_bytes())?
-            .map(|bytes| from_bytes::<Event, rancor::Error>(&bytes).map_err(anyhow::Error::from))
+            .map(|bytes| {
+                from_bytes::<EventRecord, rancor::Error>(&bytes).map_err(anyhow::Error::from)
+            })
             .transpose()
     }
 
-    pub fn iter_events(&self) -> EventIterator<'_> {
+    pub fn iter_events(&self, query: PersistQuery<EventRow>) -> EventIterator<'_> {
         let cf_events = cf!(self.db, EVENTS);
         let iter = self
             .db
             .iterator_cf(&cf_events, rocksdb::IteratorMode::Start);
-        EventIterator { iter }
+        EventIterator { iter, query }
     }
 
-    pub fn insert_event(&self, raw: &RawEventData) -> Result<Option<Event>> {
+    pub fn iter_edges(&self, query: PersistQuery<Edge>) -> EdgeIterator<'_> {
+        let cf_events = cf!(self.db, EVENTS);
+        EdgeIterator {
+            iter: self
+                .db
+                .iterator_cf(&cf_events, rocksdb::IteratorMode::Start),
+            query,
+            row_bytes: None,
+            tag_index: 0,
+        }
+    }
+
+    pub fn insert_event(&self, raw: &EventRaw) -> Result<Option<EventRecord>> {
         let mut batch = InternBatch::new(&self.db);
-        let result = self.insert_event_single(&mut batch, raw)?;
+        let result = self.insert_event_internal(&mut batch, raw)?;
         self.db.write(batch.write_batch)?;
         Ok(result)
     }
 
-    pub fn insert_events(&self, raw_events: &[RawEventData]) -> Result<usize> {
+    pub fn insert_events(&self, raw_events: &[EventRaw]) -> Result<usize> {
         let mut intern_batch = InternBatch::new(&self.db);
         let mut inserted_count = 0;
 
         for raw_event in raw_events {
             if self
-                .insert_event_single(&mut intern_batch, raw_event)?
+                .insert_event_internal(&mut intern_batch, raw_event)?
                 .is_some()
             {
                 inserted_count += 1;
@@ -119,11 +141,11 @@ impl PersistStore {
         Ok(inserted_count)
     }
 
-    fn insert_event_single(
+    fn insert_event_internal(
         &self,
         batch: &mut InternBatch,
-        raw: &RawEventData,
-    ) -> Result<Option<Event>> {
+        raw: &EventRaw,
+    ) -> Result<Option<EventRecord>> {
         let cf_events = cf!(self.db, EVENTS);
         let cf_by_pubkey = cf!(self.db, EVENTS_BY_PUBKEY);
 
@@ -138,7 +160,7 @@ impl PersistStore {
             serde_json::from_slice(&raw.tags_json).unwrap_or_default();
 
         let tags = self.parse_and_intern_tags(batch, &parsed_tags)?;
-        let event = Event {
+        let event = EventRecord {
             id,
             pubkey,
             kind: raw.kind,
@@ -174,12 +196,12 @@ impl PersistStore {
         &self,
         batch: &mut InternBatch,
         tags: &[Vec<&str>],
-    ) -> Result<Vec<Edge>> {
+    ) -> Result<Vec<EventTag>> {
         tags.iter()
             .filter_map(|tag| {
                 let tag_name = *tag.first()?;
                 let value = *tag.get(1)?;
-                let edge_result: Result<Edge> = match tag_name {
+                let edge_result: Result<EventTag> = match tag_name {
                     "e" => {
                         let id_bytes = decode_hex32(value.as_bytes())?;
                         self.interner
@@ -187,49 +209,53 @@ impl PersistStore {
                             .map(|interned| {
                                 let marker = tag.get(3).copied();
                                 match marker {
-                                    Some("reply") => Edge::Reply(interned),
-                                    Some("root") => Edge::RootReply(interned),
-                                    _ => Edge::Mention(interned),
+                                    Some("reply") => EventTag::Reply(interned),
+                                    Some("root") => EventTag::RootReply(interned),
+                                    _ => EventTag::Mention(interned),
                                 }
                             })
                     }
                     "p" => {
                         let bytes = decode_hex32(value.as_bytes())?;
-                        self.interner.intern_batch(batch, &bytes).map(Edge::Pubkey)
+                        self.interner
+                            .intern_batch(batch, &bytes)
+                            .map(EventTag::Pubkey)
                     }
                     "P" => {
                         let bytes = decode_hex32(value.as_bytes())?;
                         self.interner
                             .intern_batch(batch, &bytes)
-                            .map(Edge::PubkeyUpper)
+                            .map(EventTag::PubkeyUpper)
                     }
                     "q" => {
                         if value.contains(':') {
                             let (pubkey, address) = parse_address(value, batch, &self.interner)?;
-                            Ok(Edge::QuoteAddress { pubkey, address })
+                            Ok(EventTag::QuoteAddress { pubkey, address })
                         } else {
                             let bytes = decode_hex32(value.as_bytes())?;
-                            self.interner.intern_batch(batch, &bytes).map(Edge::Quote)
+                            self.interner
+                                .intern_batch(batch, &bytes)
+                                .map(EventTag::Quote)
                         }
                     }
                     "a" => {
                         let (pubkey, address) = parse_address(value, batch, &self.interner)?;
-                        Ok(Edge::Address { pubkey, address })
+                        Ok(EventTag::Address { pubkey, address })
                     }
                     "t" => {
                         let lowercase = value.to_lowercase();
                         self.interner
                             .intern_batch(batch, lowercase.as_bytes())
-                            .map(Edge::Hashtag)
+                            .map(EventTag::Hashtag)
                     }
                     "d" => self
                         .interner
                         .intern_batch(batch, value.as_bytes())
-                        .map(Edge::DTag),
+                        .map(EventTag::DTag),
                     "bolt11" => self
                         .interner
                         .intern_batch(batch, value.as_bytes())
-                        .map(Edge::Bolt11),
+                        .map(EventTag::Bolt11),
                     _ => {
                         return None;
                     }
@@ -240,7 +266,7 @@ impl PersistStore {
             .collect()
     }
 
-    fn find_replaceable_event(&self, event: &Event) -> Result<Option<Event>> {
+    fn find_replaceable_event(&self, event: &EventRecord) -> Result<Option<EventRecord>> {
         let cf_by_pubkey = cf!(self.db, EVENTS_BY_PUBKEY);
 
         let prefix = event.key_by_pubkey_prefix();
@@ -307,8 +333,9 @@ fn parse_address(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::helpers::TestStore;
+    use types::event::EventRaw;
+
+    use crate::{edges::EdgeLabel, helpers::TestStore, query::PersistQuery};
 
     #[test]
     fn assert_get_event_not_found() {
@@ -320,7 +347,7 @@ mod tests {
     fn assert_insert_event() {
         let store = TestStore::new();
 
-        let raw = RawEventData {
+        let raw = EventRaw {
             id: [1u8; 32],
             pubkey: [2u8; 32],
             kind: 1,
@@ -342,7 +369,7 @@ mod tests {
         let store = TestStore::new();
 
         let pubkey = [2u8; 32];
-        let raw = RawEventData {
+        let raw = EventRaw {
             id: [1u8; 32],
             pubkey,
             kind: 1,
@@ -358,39 +385,19 @@ mod tests {
     }
 
     #[test]
-    fn assert_iter_events() {
-        let store = TestStore::new();
-
-        let pubkey = [1u8; 32];
-        for i in 0..3u8 {
-            let raw = RawEventData {
-                id: [i + 10; 32],
-                pubkey,
-                kind: 1,
-                created_at: 1000 + i as u64,
-                tags_json: b"[]".to_vec(),
-            };
-            store.insert_event(&raw).unwrap();
-        }
-
-        let events: Vec<_> = store.iter_events().flatten().collect();
-        assert_eq!(events.len(), 3);
-    }
-
-    #[test]
     fn assert_replaceable_event_newer_replaces_older() {
         let store = TestStore::new();
 
         let pubkey = [1u8; 32];
 
-        let old_raw = RawEventData {
+        let old_raw = EventRaw {
             id: [2u8; 32],
             pubkey,
             kind: 0,
             created_at: 1,
             tags_json: b"[]".to_vec(),
         };
-        let new_raw = RawEventData {
+        let new_raw = EventRaw {
             id: [3u8; 32],
             pubkey,
             kind: 0,
@@ -411,14 +418,14 @@ mod tests {
 
         let pubkey = [1u8; 32];
 
-        let new_raw = RawEventData {
+        let new_raw = EventRaw {
             id: [2u8; 32],
             pubkey,
             kind: 0,
             created_at: 2,
             tags_json: b"[]".to_vec(),
         };
-        let old_raw = RawEventData {
+        let old_raw = EventRaw {
             id: [3u8; 32],
             pubkey,
             kind: 0,
@@ -439,14 +446,14 @@ mod tests {
 
         let pubkey = [1u8; 32];
 
-        let old_raw = RawEventData {
+        let old_raw = EventRaw {
             id: [2u8; 32],
             pubkey,
             kind: 30023,
             created_at: 1000,
             tags_json: b"[[\"d\",\"test\"]]".to_vec(),
         };
-        let new_raw = RawEventData {
+        let new_raw = EventRaw {
             id: [3u8; 32],
             pubkey,
             kind: 30023,
@@ -467,14 +474,14 @@ mod tests {
 
         let pubkey = [1u8; 32];
 
-        let raw1 = RawEventData {
+        let raw1 = EventRaw {
             id: [2u8; 32],
             pubkey,
             kind: 30023,
             created_at: 1,
             tags_json: b"[[\"d\",\"first\"]]".to_vec(),
         };
-        let raw2 = RawEventData {
+        let raw2 = EventRaw {
             id: [3u8; 32],
             pubkey,
             kind: 30023,
@@ -496,21 +503,21 @@ mod tests {
         let pubkey = [1u8; 32];
 
         let raw_events = vec![
-            RawEventData {
+            EventRaw {
                 id: [2u8; 32],
                 pubkey,
                 kind: 1,
                 created_at: 1000,
                 tags_json: b"[]".to_vec(),
             },
-            RawEventData {
+            EventRaw {
                 id: [3u8; 32],
                 pubkey,
                 kind: 1,
                 created_at: 1001,
                 tags_json: b"[]".to_vec(),
             },
-            RawEventData {
+            EventRaw {
                 id: [4u8; 32],
                 pubkey,
                 kind: 1,
@@ -522,7 +529,113 @@ mod tests {
         let inserted = store.insert_events(&raw_events).unwrap();
         assert_eq!(inserted, 3);
 
-        let events: Vec<_> = store.iter_events().flatten().collect();
+        let events: Vec<_> = store.iter_events(PersistQuery::events()).collect();
         assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn assert_iter_events() {
+        let store = TestStore::new();
+
+        let pubkey = [1u8; 32];
+        for i in 0..3u8 {
+            let event = EventRaw {
+                id: [i + 10; 32],
+                pubkey,
+                kind: 1,
+                created_at: 1000 + i as u64,
+                tags_json: b"[]".to_vec(),
+            };
+            store.insert_event(&event).unwrap();
+        }
+
+        let events: Vec<_> = store.iter_events(PersistQuery::events()).collect();
+        assert_eq!(events.len(), 3);
+    }
+
+    fn hex32(byte: u8) -> String {
+        hex::encode([byte; 32])
+    }
+
+    #[test]
+    fn assert_iter_edges() {
+        let store = TestStore::new();
+
+        let pubkey = [10u8; 32];
+        let pubkey2 = [20u8; 32];
+        let pubkey3 = [30u8; 32];
+        let e_tag_1 = hex32(1);
+        let e_tag_2 = hex32(2);
+        let p_tag_1 = hex32(3);
+        let p_tag_2 = hex32(4);
+        let event = EventRaw {
+            id: [1; 32],
+            pubkey,
+            kind: 1,
+            created_at: 1000,
+            tags_json: format!(r#"[["e", "{e_tag_1}"], ["p", "{p_tag_1}"]]"#).into_bytes(),
+        };
+        let event2 = EventRaw {
+            id: [2; 32],
+            pubkey: pubkey2,
+            kind: 1,
+            created_at: 2000,
+            tags_json: format!(r#"[["e", "{e_tag_2}"], ["p", "{p_tag_2}"]]"#).into_bytes(),
+        };
+        let event3 = EventRaw {
+            id: [3; 32],
+            pubkey: pubkey3,
+            kind: 3,
+            created_at: 3000,
+            tags_json: format!(r#"[["p", "{p_tag_1}"], ["p", "{p_tag_2}"]]"#).into_bytes(),
+        };
+        store.insert_event(&event).unwrap();
+        store.insert_event(&event2).unwrap();
+        store.insert_event(&event3).unwrap();
+
+        let get_interner =
+            |bytes: &[u8; 32]| store.interner.intern(&store.db, bytes.as_slice()).unwrap();
+
+        let pubkey_sym = get_interner(&pubkey);
+        let pubkey_sym2 = get_interner(&pubkey2);
+        let pubkey_sym3 = get_interner(&pubkey3);
+
+        let query = PersistQuery::edges();
+        let edges: Vec<_> = store.iter_edges(query).collect();
+        assert_eq!(
+            edges,
+            vec![
+                (pubkey_sym, 1),
+                (pubkey_sym, 3),
+                (pubkey_sym3, 3),
+                (pubkey_sym3, 6),
+                (pubkey_sym2, 4),
+                (pubkey_sym2, 6),
+            ]
+        );
+
+        let query = PersistQuery::edges().kinds(vec![1]);
+        let edges: Vec<_> = store.iter_edges(query).collect();
+        assert_eq!(
+            edges,
+            vec![
+                (pubkey_sym, 1),
+                (pubkey_sym, 3),
+                (pubkey_sym2, 4),
+                (pubkey_sym2, 6),
+            ]
+        );
+
+        let query = PersistQuery::edges().label(vec![EdgeLabel::Pubkey]);
+        let edges: Vec<_> = store.iter_edges(query).collect();
+        assert_eq!(
+            edges,
+            vec![
+                (pubkey_sym, 3),
+                (pubkey_sym3, 3),
+                (pubkey_sym3, 6),
+                (pubkey_sym2, 6),
+            ]
+        );
     }
 }
