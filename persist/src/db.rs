@@ -37,6 +37,31 @@ impl PersistStore {
 
         Ok(PersistStore { db, interner })
     }
+
+    pub fn save_checkpoint(&self, checkpoint: u64) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(schema::CHECKPOINTS)
+            .expect("checkpoint cf must exist");
+        self.db.put_cf(&cf, b"latest", checkpoint.to_be_bytes())?;
+        Ok(())
+    }
+
+    pub fn load_checkpoint(&self) -> Result<Option<u64>> {
+        let cf = self
+            .db
+            .cf_handle(schema::CHECKPOINTS)
+            .expect("checkpoint cf must exist");
+        if let Some(value) = self.db.get_pinned_cf(&cf, b"latest")? {
+            let bytes: [u8; 8] = value
+                .as_ref()
+                .try_into()
+                .expect("checkpoint must be 8 bytes");
+            Ok(Some(u64::from_be_bytes(bytes)))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
