@@ -1,16 +1,15 @@
-use anyhow::{Error, Result, anyhow};
+use anyhow::Result;
 use std::env;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_postgres::Client;
 use tokio_postgres::error::SqlState;
+use types::event::EventRaw;
 
 use differential_dataflow::{AsCollection, VecCollection};
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
 use timely::container::CapacityContainerBuilder;
-use timely::dataflow::channels::pact::{Exchange, Pipeline};
-use timely::dataflow::operators::Operator;
+use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::{Scope, Stream};
 
 use postgres_replication::LogicalReplicationStream;
@@ -18,9 +17,7 @@ use postgres_replication::protocol::{LogicalReplicationMessage, ReplicationMessa
 use tokio_postgres::types::PgLsn;
 
 use crate::config::Config;
-use crate::event::{EventRow, Tags};
 use crate::operators::builder_async::{AsyncOperatorBuilder, Event};
-use crate::operators::probe::Handle;
 use crate::sources::postgres::connection::PostgresConnection;
 use crate::types::Diff;
 
@@ -34,19 +31,16 @@ pub fn replication<G>(
     scope: &G,
     config: Config,
     lsn_stream: &Stream<G, u64>,
-    probe: &Handle<u64>,
-) -> VecCollection<G, EventRow, Diff>
+) -> VecCollection<G, EventRaw, Diff>
 where
     G: Scope<Timestamp = u64>,
 {
     let mut builder = AsyncOperatorBuilder::new("PgReplicationDataflow".to_string(), scope.clone());
 
     let (raw_handle, raw_stream) =
-        builder.new_output::<CapacityContainerBuilder<Vec<(EventParts, u64, Diff)>>>();
+        builder.new_output::<CapacityContainerBuilder<Vec<(EventRaw, u64, Diff)>>>();
 
     let mut lsn_input = builder.new_disconnected_input(lsn_stream, Pipeline);
-
-    let probe = probe.clone();
 
     let _ = builder.build_fallible(move |capabilities| {
         Box::pin(async move {
@@ -81,6 +75,14 @@ where
 
             let resume_lsn_pg = PgLsn::from(resume_lsn_u64);
 
+
+            tracing::info!(
+                "PgReplication started (slot={}, publication={} resume_lsn={})",
+                slot,
+                publication,
+                resume_lsn_pg
+            );
+
             let query = format!(
                 "START_REPLICATION SLOT \"{}\" LOGICAL {} \
                  (\"proto_version\" '1', \"publication_names\" '{}')",
@@ -101,48 +103,10 @@ where
             let mut commit_lsn_u64: Option<u64> = None;
             let mut data_upper = resume_lsn_u64;
 
-            tracing::info!(
-                "PgReplication started (slot={}, publication={})",
-                slot,
-                publication
-            );
 
-            let mut total_inserted = 0;
-            let mut total_deleted = 0;
-
-            let mut current_round = resume_lsn_u64;
-            let mut last_flushed_round: Option<u64> = None;
-
-            let mut pending: Vec<(EventParts, Diff)> = Vec::new();
-            let mut pending_flush = false;
-
-            // Let the initial capability from snapshot through
-            raw_cap.downgrade([current_round]);
+            raw_cap.downgrade([resume_lsn_u64]);
 
             loop {
-                let at_capacity = pending.len() >= config.replication_max_pending;
-                let downstream_ready = match last_flushed_round {
-                    None => true, 
-                    Some(prev) => probe.with_frontier(|f| !f.less_equal(&prev)),
-                };
-                if pending_flush && downstream_ready && !pending.is_empty() {
-                    tracing::info!(
-                        "flushing round {} ({} events) -> next round {}",
-                        current_round,
-                        pending.len(),
-                        data_upper,
-                    );
-
-                    for (parts, diff) in pending.drain(..) {
-                        raw_handle.give(&raw_cap[0], (parts, current_round, diff));
-                    }
-
-                    last_flushed_round = Some(current_round);
-                    current_round = data_upper;
-                    raw_cap.downgrade([current_round]);
-                    pending_flush = false;
-                }
-
                 tokio::select! {
                     biased;
 
@@ -155,9 +119,7 @@ where
                             .await?;
                     },
 
-                    _ = probe.progressed(), if at_capacity => {},
-
-                    Some(message) = logical_stream.next(), if !at_capacity => {
+                    Some(message) = logical_stream.next() => {
                         match message {
                             Ok(ReplicationMessage::XLogData(xlog)) => {
                                 let logical = xlog.into_data();
@@ -170,40 +132,28 @@ where
                                     LogicalReplicationMessage::Commit(_) => {
                                         if let Some(lsn) = commit_lsn_u64.take() {
                                             data_upper = lsn + 1;
-                                            pending_flush = true;
-                                            tracing::info!(
-                                                "Worker {}] replication commit (inserted: {}, deleted: {}, LSN: {})",
-                                                config.worker_id,
-                                                total_inserted,
-                                                total_deleted,
-                                                lsn
-                                            );
-                                            total_inserted = 0;
-                                            total_deleted = 0;
                                         }
                                     }
                                     LogicalReplicationMessage::Insert(insert) => {
                                         if  commit_lsn_u64.is_none() {
                                             continue
                                         };
-                                        let Some(parts) = EventParts::from_tuple_fixed(insert.tuple().tuple_data()) else {
-                                            continue
+                                        let Some(event) = parse_event_raw(insert.tuple().tuple_data()) else {
+                                            continue;
                                         };
 
-                                        total_inserted += 1;
-                                        pending.push((parts, ONE));
+                                        raw_handle.give(&raw_cap[0], (event, data_upper, ONE));
                                     }
                                     LogicalReplicationMessage::Delete(delete) => {
                                         if  commit_lsn_u64.is_none() {
                                             continue
                                         };
                                         let Some(old) = delete.old_tuple() else { continue };
-                                        let Some(parts) = EventParts::from_tuple_fixed(old.tuple_data()) else {
+                                        let Some(event) = parse_event_raw(old.tuple_data()) else {
                                             continue
                                         };
 
-                                        total_deleted += 1;
-                                        pending.push((parts, MINUS_ONE));
+                                        raw_handle.give(&raw_cap[0], (event, data_upper, MINUS_ONE));
                                     }
                                     LogicalReplicationMessage::Update(_) => {}
                                     _ => {}
@@ -214,6 +164,7 @@ where
                                 let wal_end: u64 = keepalive.wal_end();
                                 if wal_end > data_upper {
                                     data_upper = wal_end;
+                                    raw_cap.downgrade([data_upper]);
                                 }
                             }
 
@@ -235,118 +186,50 @@ where
         })
     });
 
-    // Decode replication data in multiple workers
-    let mut next_worker = (0..(scope.peers() as u64))
-        .flat_map(|w| std::iter::repeat_n(w, 1000))
-        .cycle();
-    let round_robin = Exchange::new(move |_| next_worker.next().unwrap());
-
-    raw_stream
-        .unary(round_robin, "PgReplicationDecode", |_, _| {
-            move |input, output| {
-                input.for_each_time(|cap, data| {
-                    let mut session = output.session(&cap);
-                    for (event_parts, time, diff) in data.flat_map(|batch| batch.drain(..)) {
-                        match EventRow::try_from(event_parts) {
-                            Ok(event) => {
-                                session.give((event, time, diff));
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    "failed to decode EventParts at {}: {:?}",
-                                    time,
-                                    err
-                                );
-                            }
-                        }
-                    }
-                });
-            }
-        })
-        .as_collection()
+    raw_stream.as_collection()
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-struct EventParts {
-    id: Vec<u8>,
-    pubkey: Vec<u8>,
-    created_at: Vec<u8>,
-    kind: Vec<u8>,
-    tags: Vec<u8>,
+fn parse_u64(bytes: &[u8]) -> Option<u64> {
+    atoi::atoi(bytes)
 }
 
-impl EventParts {
-    fn from_tuple_fixed(tuple: &[TupleData]) -> Option<Self> {
-        let id = tuple_text(tuple.first()?)?;
-        let pubkey = tuple_text(tuple.get(1)?)?;
-        let created_at = tuple_text(tuple.get(2)?)?;
-        let kind = tuple_text(tuple.get(3)?)?;
-        let tags = tuple_text(tuple.get(4)?)?;
-
-        Some(Self {
-            id: id.to_vec(),
-            pubkey: pubkey.to_vec(),
-            created_at: created_at.to_vec(),
-            kind: kind.to_vec(),
-            tags: tags.to_vec(),
-        })
-    }
-
-    fn created_at_u64(&self) -> Result<u64> {
-        let text = std::str::from_utf8(&self.created_at)?;
-        atoi::atoi::<u64>(text.as_bytes()).ok_or_else(|| anyhow!("invalid created_at"))
-    }
-
-    fn kind_u16(&self) -> Result<u16> {
-        let text = std::str::from_utf8(&self.kind)?;
-        atoi::atoi::<u16>(text.as_bytes()).ok_or_else(|| anyhow!("invalid kind"))
-    }
-
-    fn id_32(&self) -> Result<[u8; 32]> {
-        parse_hex_32(&self.id)
-    }
-
-    fn pubkey_32(&self) -> Result<[u8; 32]> {
-        parse_hex_32(&self.pubkey)
-    }
+fn parse_u16(bytes: &[u8]) -> Option<u16> {
+    atoi::atoi(bytes)
 }
 
-impl TryFrom<EventParts> for EventRow {
-    type Error = Error;
-
-    fn try_from(parts: EventParts) -> Result<Self> {
-        let id = parts.id_32()?;
-        let pubkey = parts.pubkey_32()?;
-        let created_at = parts.created_at_u64()?;
-
-        let kind_value = parts.kind_u16()?;
-        let kind = nostr_sdk::Kind::from_u16(kind_value);
-        let tags = Tags::parse_from_bytes(&parts.tags);
-
-        Ok(EventRow {
-            id,
-            pubkey,
-            created_at,
-            kind,
-            tags,
-        })
-    }
-}
-
-fn parse_hex_32(bytes: &[u8]) -> Result<[u8; 32]> {
-    let text = std::str::from_utf8(bytes)?.trim();
-    let mut out = [0u8; 32];
-    hex::decode_to_slice(text, &mut out).map_err(|_| anyhow!("invalid 32-byte hex value"))?;
-    Ok(out)
-}
-
-fn tuple_text(data: &TupleData) -> Option<&[u8]> {
+fn tuple_bytes(data: &TupleData) -> Option<&[u8]> {
     match data {
         TupleData::Text(bytes) => Some(bytes),
         TupleData::Null => Some(b""),
-        TupleData::UnchangedToast => None,
-        TupleData::Binary(_) => None,
+        TupleData::UnchangedToast | TupleData::Binary(_) => None,
     }
+}
+
+fn parse_event_raw(tuple: &[TupleData]) -> Option<EventRaw> {
+    let id = parse_hex_32(tuple_bytes(tuple.first()?)?)?;
+    let pubkey = parse_hex_32(tuple_bytes(tuple.get(1)?)?)?;
+    let created_at = parse_u64(tuple_bytes(tuple.get(2)?)?)?;
+    let kind = parse_u16(tuple_bytes(tuple.get(3)?)?)?;
+    let tags_json = match tuple.get(4)? {
+        TupleData::Text(bytes) => bytes.to_vec(),
+        TupleData::Null => b"[]".to_vec(),
+        TupleData::UnchangedToast | TupleData::Binary(_) => return None,
+    };
+
+    Some(EventRaw {
+        id,
+        pubkey,
+        created_at,
+        kind,
+        tags_json,
+    })
+}
+
+fn parse_hex_32(bytes: &[u8]) -> Option<[u8; 32]> {
+    let text = std::str::from_utf8(bytes).ok()?.trim();
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(text, &mut out).ok()?;
+    Some(out)
 }
 
 pub async fn ensure_replication_slot(client: &Client, slot_name: &str) -> Result<()> {

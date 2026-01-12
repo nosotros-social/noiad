@@ -10,7 +10,7 @@ use timely::{
 
 use crate::types::Diff;
 
-type Iter = u32;
+type Iter = usize;
 
 /// For reference: https://github.com/TimelyDataflow/differential-dataflow/blob/master/differential-dataflow/examples/pagerank.rs
 pub fn pagerank<G, D>(

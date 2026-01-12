@@ -14,6 +14,9 @@ dotenvy = "0.15.7"
 futures = "0.3.31"
 futures-util = "0.3.31"
 hex = "0.4.3"
+lightning-invoice = "0.34.0"
+nostr-sdk = "0.44.1"
+persist = { path = "../persist" }
 postgres-replication = { git = "https://github.com/materializeinc/rust-postgres", package = "postgres-replication" }
 serde = "1.0.228"
 serde_json = "1.0.145"
@@ -23,6 +26,8 @@ tokio-postgres = { git = "https://github.com/materializeinc/rust-postgres" }
 tokio-stream = { version = "0.1.17", features = ["time"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"
+types = { version = "0.1.0", path = "../types" }
 
 [dev-dependencies]
+lightning = "0.2.0"
 tokio-stream = "0.1.17"

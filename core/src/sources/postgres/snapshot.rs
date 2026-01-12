@@ -10,15 +10,15 @@ use timely::dataflow::operators::Operator;
 use timely::{container::CapacityContainerBuilder, dataflow::Scope};
 use tokio_postgres::SimpleQueryMessage;
 use tokio_postgres::types::PgLsn;
+use types::event::EventRaw;
 
 use crate::config::Config;
-use crate::event::EventRow;
 use crate::operators::builder_async::AsyncOperatorBuilder;
 use crate::sources::postgres::connection::PostgresConnection;
 use crate::sources::postgres::parser::{CopyParser, quote_ident};
 use crate::sources::postgres::utils::get_publication_info;
 
-pub fn snapshot<G>(scope: &G, config: Config) -> (VecCollection<G, EventRow>, Stream<G, u64>)
+pub fn snapshot<G>(scope: &G, config: Config) -> (VecCollection<G, EventRaw>, Stream<G, u64>)
 where
     G: Scope<Timestamp = u64>,
 {
@@ -33,6 +33,15 @@ where
 
             let is_snapshot_leader = config.worker_id == 0;
             if is_snapshot_leader {
+                if let Some(checkpoint) = config.persist.load_checkpoint()? {
+                    tracing::info!(
+                        "[Worker {}] POSTGRES Snapshot skipped, loaded checkpoint at LSN {}",
+                        config.worker_id,
+                        checkpoint
+                    );
+                    lsn_handle.give(&lsn_cap[0], checkpoint);
+                    return Ok(());
+                }
                 let client = PostgresConnection::from_env().connect().await?;
                 let db_publication =
                     env::var("DB_PUBLICATION").expect("DB_PUBLICATION must be set");
@@ -90,7 +99,7 @@ where
         .cycle();
     let round_robin = Exchange::new(move |_| next_worker.next().unwrap());
 
-    let snapshot_updates: VecCollection<_, EventRow> = raw_stream
+    let snapshot_updates: VecCollection<_, EventRaw> = raw_stream
         .unary(round_robin, "PgSnapshotDecode", |_, _| {
             move |input, output| {
                 input.for_each_time(|time, data| {

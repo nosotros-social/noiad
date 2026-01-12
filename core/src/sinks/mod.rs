@@ -1,1 +1,1 @@
-pub mod pagerank_sink;
+pub mod persist_sink;

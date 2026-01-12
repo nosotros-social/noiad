@@ -2,7 +2,9 @@
 members = [
     'core',
     'relay',
-    "nostrpg"
+    "nostrpg",
+    "persist",
+    "types"
 ]
 default-members = ['relay']
 

@@ -7,5 +7,18 @@ pub struct Cli {
     pub workers: usize,
 
     #[arg(long, default_value_t = 20)]
-    pub page_rank_iterations: u32,
+    pub pagerank_iterations: usize,
+
+    #[arg(long, default_value_t = 250_000)]
+    pub pagerank_sink_batch_size: usize,
+
+    /// Maximum number of pending replication messages before applying backpressure.
+    #[arg(long, default_value_t = 10_000)]
+    pub replication_max_pending: usize,
+
+    #[arg(long, default_value_t = ("./data/db").to_owned())]
+    pub persist_path: String,
+
+    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+    pub max_total_wal_size: u64,
 }

@@ -1,14 +1,20 @@
 use clap::Parser;
 use core::algorithms::pagerank::pagerank;
-use core::cli::Cli;
 use core::config::Config;
-use core::event::EdgeLabel;
-use core::operators::top_k::TopK;
-use core::sinks::pagerank_sink::sink_pagerank;
+use core::operators::probe::{Handle, ProbeNotify};
 use core::sources::postgres::render;
-use timely::dataflow::operators::Inspect;
-
+use core::{cli::Cli, sources::persist::persist_source::persist_source};
 use differential_dataflow::operators::CountTotal;
+use persist::db::PersistStore;
+use persist::query::PersistQuery;
+use std::sync::Arc;
+use timely::dataflow::operators::Exchange;
+use timely::{
+    container::CapacityContainerBuilder,
+    dataflow::{channels::pact::Pipeline, operators::Operator},
+};
+use types::event::Node;
+
 use dotenvy::dotenv;
 
 fn main() {
@@ -25,10 +31,18 @@ fn main() {
 
     let runtime_handle = runtime.handle().clone();
 
+    let rocksdb_config = persist::db::RocksDBConfig {
+        max_total_wal_size: cli.max_total_wal_size,
+    };
+    let persist = Arc::new(
+        PersistStore::open(&cli.persist_path, rocksdb_config).expect("Failed to open PersistStore"),
+    );
+
     let _ = timely::execute(timely::Config::process(cli.workers), move |worker| {
         let _enter = runtime_handle.enter();
 
         let index = worker.index();
+        let persist = persist.clone();
 
         tracing::info!("Worker {index} started");
 
@@ -36,48 +50,87 @@ fn main() {
             let config = Config {
                 worker_id: scope.index(),
                 worker_count: scope.peers(),
+                persist: Arc::clone(&persist),
+                pagerank_iterations: cli.pagerank_iterations,
+                pagerank_sink_batch_size: cli.pagerank_sink_batch_size,
+                replication_max_pending: cli.replication_max_pending,
             };
 
-            let events = render(scope, config.clone());
+            let probe = Handle::default();
 
-            let edges_labels = events
-                .filter(|event| event.kind == 3)
-                .flat_map(|e| e.to_edges());
+            let persisted_done = render(scope, config.clone());
 
-            let pubkey_edges = edges_labels
-                .filter(|&(_, _, label)| label == EdgeLabel::Pubkey)
-                .map(|(from, to, _)| (from, to));
+            let events = persist_source(
+                scope,
+                config.clone(),
+                PersistQuery::events(),
+                &persisted_done,
+                &probe,
+            );
 
-            let ranks = pagerank(cli.page_rank_iterations, &pubkey_edges).consolidate();
+            let edges = persist_source(
+                scope,
+                config.clone(),
+                PersistQuery::edges(),
+                &persisted_done,
+                &probe,
+            );
+
+            let ranks = pagerank(cli.pagerank_iterations, &edges).consolidate();
 
             ranks
-                .count_total()
-                .map(|(node, rank)| (rank, node))
-                .top_k(50)
-                .inspect(|((rank, node), _, _)| {
-                    tracing::info!("top 50 pubkeys: {:?} {:?}", hex::encode(node), rank)
-                });
+                .inner
+                .exchange(|_| 0)
+                .unary_frontier::<CapacityContainerBuilder<Vec<(Node, u64, isize)>>, _, _, _>(
+                    Pipeline,
+                    "PageRankLog",
+                    |_cap, _info| {
+                        let mut per_ts_counts: std::collections::BTreeMap<u64, usize> =
+                            std::collections::BTreeMap::new();
 
-            edges_labels
+                        move |(input, frontier), output| {
+                            input.for_each(|cap, data| {
+                                let ts = *cap.time();
+                                *per_ts_counts.entry(ts).or_insert(0) += data.len();
+
+                                let mut session = output.session(&cap);
+                                session.give_iterator(data.drain(..));
+                            });
+
+                            while let Some((&ts, &count)) = per_ts_counts.iter().next() {
+                                if frontier.less_equal(&ts) {
+                                    break;
+                                }
+                                per_ts_counts.remove(&ts);
+                                tracing::info!(
+                                    "[Worker {}] pagerank finished @ {}: nodes={}",
+                                    config.worker_id,
+                                    ts,
+                                    count
+                                );
+                            }
+                        }
+                    },
+                )
+                .probe_notify_with(vec![probe.clone()]);
+
+            edges
                 .map(|_| ())
                 .count_total()
-                .inner
-                .inspect(|(((), total), _t, diff)| {
+                .inspect(move |(((), total), _t, diff)| {
                     if *diff > 0 {
-                        tracing::info!("event edges decoded: {total}");
+                        tracing::info!("[Worker {}] total edges: {}", config.worker_id, total);
                     }
                 });
 
             events
                 .map(|_| ())
                 .count_total()
-                .inspect(|(((), total), _t, diff)| {
+                .inspect(move |(((), total), _t, diff)| {
                     if *diff > 0 {
-                        tracing::info!("events decoded: {total}");
+                        tracing::info!("[Worker {}] total events: {}", config.worker_id, total);
                     }
                 });
-
-            sink_pagerank(&ranks, config);
         });
 
         while worker.step_or_park(None) {}
