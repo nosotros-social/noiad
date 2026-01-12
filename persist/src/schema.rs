@@ -1,15 +1,17 @@
-pub const INTERN_FORWARD: &str = "intern_forward";
-pub const INTERN_REVERSE: &str = "intern_reverse";
-pub const EVENTS: &str = "events";
-pub const EVENTS_BY_PUBKEY: &str = "events_by_pubkey";
-pub const CHECKPOINTS: &str = "checkpoints";
+pub const INTERN_FORWARD_CF: &str = "intern_forward";
+pub const INTERN_REVERSE_CF: &str = "intern_reverse";
+pub const EVENTS_CF: &str = "events";
+pub const REPLACEABLE_CF: &str = "replaceable";
+pub const ADDRESSABLE_CF: &str = "addressable";
+pub const CHECKPOINTS_CF: &str = "checkpoints";
 
 pub const COLUMN_FAMILIES: &[&str] = &[
-    INTERN_FORWARD,
-    INTERN_REVERSE,
-    EVENTS,
-    EVENTS_BY_PUBKEY,
-    CHECKPOINTS,
+    INTERN_FORWARD_CF,
+    INTERN_REVERSE_CF,
+    EVENTS_CF,
+    REPLACEABLE_CF,
+    ADDRESSABLE_CF,
+    CHECKPOINTS_CF,
 ];
 
 macro_rules! cf {

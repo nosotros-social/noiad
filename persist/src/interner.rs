@@ -5,7 +5,7 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::schema::{INTERN_FORWARD, INTERN_REVERSE, cf};
+use crate::schema::{INTERN_FORWARD_CF, INTERN_REVERSE_CF, cf};
 
 #[derive(Debug)]
 pub struct Interner {
@@ -38,7 +38,7 @@ impl Interner {
     }
 
     pub fn find_max_symbol(db: &DBWithThreadMode<MultiThreaded>) -> Result<u32> {
-        let cf = cf!(db, INTERN_REVERSE);
+        let cf = cf!(db, INTERN_REVERSE_CF);
         let mut iter = db.raw_iterator_cf(&cf);
         iter.seek_to_last();
 
@@ -54,8 +54,8 @@ impl Interner {
     }
 
     pub fn intern(&self, db: &DBWithThreadMode<MultiThreaded>, bytes: &[u8]) -> Result<u32> {
-        let cf_forward = cf!(db, INTERN_FORWARD);
-        let cf_reverse = cf!(db, INTERN_REVERSE);
+        let cf_forward = cf!(db, INTERN_FORWARD_CF);
+        let cf_reverse = cf!(db, INTERN_REVERSE_CF);
 
         if let Some(pinned) = db.get_pinned_cf(&cf_forward, bytes)? {
             let arr: [u8; 4] = pinned[..4].try_into().expect("must be 4 bytes");
@@ -77,8 +77,8 @@ impl Interner {
             return Ok(*symbol);
         }
 
-        let cf_forward = cf!(batch.db, INTERN_FORWARD);
-        let cf_reverse = cf!(batch.db, INTERN_REVERSE);
+        let cf_forward = cf!(batch.db, INTERN_FORWARD_CF);
+        let cf_reverse = cf!(batch.db, INTERN_REVERSE_CF);
 
         if let Some(pinned) = batch.db.get_pinned_cf(&cf_forward, bytes)? {
             let array: [u8; 4] = pinned[..4]
@@ -107,7 +107,7 @@ impl Interner {
         db: &DBWithThreadMode<MultiThreaded>,
         symbol: u32,
     ) -> Result<Option<Vec<u8>>> {
-        let cf_reverse = cf!(db, INTERN_REVERSE);
+        let cf_reverse = cf!(db, INTERN_REVERSE_CF);
         let symbol_bytes = symbol.to_be_bytes();
         let bytes = db.get_cf(&cf_reverse, symbol_bytes)?;
         Ok(bytes)

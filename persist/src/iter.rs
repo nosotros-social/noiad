@@ -6,7 +6,7 @@ use crate::{
     edges::EdgeLabel,
     event::{ArchivedEventRecord, EventRecord},
     query::PersistQuery,
-    schema::{EVENTS, cf},
+    schema::{EVENTS_CF, cf},
     tag::EventTag,
 };
 
@@ -195,7 +195,7 @@ impl PersistQueryIter for PersistQuery<Edge> {
 
 impl PersistStore {
     pub fn iter_events(&self, query: PersistQuery<EventRow>) -> EventIterator<'_> {
-        let cf_events = cf!(self.db, EVENTS);
+        let cf_events = cf!(self.db, EVENTS_CF);
         let iter = self
             .db
             .iterator_cf(&cf_events, rocksdb::IteratorMode::Start);
@@ -203,7 +203,7 @@ impl PersistStore {
     }
 
     pub fn iter_edges(&self, query: PersistQuery<Edge>) -> EdgeIterator<'_> {
-        let cf_events = cf!(self.db, EVENTS);
+        let cf_events = cf!(self.db, EVENTS_CF);
         EdgeIterator {
             iter: self
                 .db

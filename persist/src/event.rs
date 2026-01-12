@@ -5,7 +5,7 @@ use types::event::{EventRaw, EventRow};
 
 use crate::db::{PersistInputUpdate, PersistStore, PersistUpdate};
 use crate::interner::InternBatch;
-use crate::schema::{EVENTS, EVENTS_BY_PUBKEY, cf};
+use crate::schema::{ADDRESSABLE_CF, EVENTS_CF, REPLACEABLE_CF, cf};
 use crate::tag::EventTag;
 
 #[derive(Archive, Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -33,19 +33,20 @@ impl EventRecord {
         self.id.to_be_bytes()
     }
 
-    pub fn key_by_pubkey(&self) -> [u8; 10] {
-        let mut key = [0u8; 10];
-        key[0..4].copy_from_slice(&self.pubkey.to_be_bytes());
-        key[4..6].copy_from_slice(&self.kind.to_be_bytes());
-        key[6..10].copy_from_slice(&self.id.to_be_bytes());
-        key
-    }
-
-    pub fn key_by_pubkey_prefix(&self) -> [u8; 6] {
+    pub fn replaceable_key(&self) -> [u8; 6] {
         let mut key = [0u8; 6];
         key[0..4].copy_from_slice(&self.pubkey.to_be_bytes());
         key[4..6].copy_from_slice(&self.kind.to_be_bytes());
         key
+    }
+
+    pub fn addressable_key(&self) -> Option<[u8; 10]> {
+        let d = self.d_tag()?;
+        let mut key = [0u8; 10];
+        key[0..4].copy_from_slice(&self.pubkey.to_be_bytes());
+        key[4..6].copy_from_slice(&self.kind.to_be_bytes());
+        key[6..10].copy_from_slice(&d.to_be_bytes());
+        Some(key)
     }
 
     pub fn is_replaceable(&self) -> bool {
@@ -66,7 +67,7 @@ impl EventRecord {
 
 impl PersistStore {
     pub fn get_event(&self, id: u32) -> Result<Option<EventRecord>> {
-        let cf_events = cf!(self.db, EVENTS);
+        let cf_events = cf!(self.db, EVENTS_CF);
         self.db
             .get_cf(&cf_events, id.to_be_bytes())?
             .map(|bytes| {
@@ -87,8 +88,7 @@ impl PersistStore {
         batch: &mut InternBatch,
         raw: &EventRaw,
     ) -> Result<Option<EventRecord>> {
-        let cf_events = cf!(self.db, EVENTS);
-        let cf_by_pubkey = cf!(self.db, EVENTS_BY_PUBKEY);
+        let cf_events = cf!(self.db, EVENTS_CF);
 
         let id = self.interner.intern_batch(batch, &raw.id)?;
         let pubkey = self.interner.intern_batch(batch, &raw.pubkey)?;
@@ -109,34 +109,60 @@ impl PersistStore {
             tags,
         };
 
-        if (event.is_replaceable() || event.is_addressable())
-            && let Some(old_event) = self.find_replaceable_event(&event)?
-        {
-            if old_event.created_at >= event.created_at {
-                return Ok(None);
+        if event.is_replaceable() {
+            if let Some(old_event) = self.find_replaceable(&event)? {
+                if old_event.created_at >= event.created_at {
+                    return Ok(None);
+                }
+                self.delete_event(batch, &old_event);
             }
+            let cf_replaceable = cf!(self.db, REPLACEABLE_CF);
+            batch.write_batch.put_cf(
+                &cf_replaceable,
+                event.replaceable_key(),
+                event.id.to_be_bytes(),
+            );
+        }
 
-            self.delete_event(batch, &old_event);
+        if event.is_addressable() {
+            if let Some(old_event) = self.find_addressable(&event)? {
+                if old_event.created_at >= event.created_at {
+                    return Ok(None);
+                }
+                self.delete_event(batch, &old_event);
+            }
+            if let Some(key) = event.addressable_key() {
+                let cf_addressable = cf!(self.db, ADDRESSABLE_CF);
+                batch
+                    .write_batch
+                    .put_cf(&cf_addressable, key, event.id.to_be_bytes());
+            }
         }
 
         let event_value = to_bytes::<rancor::Error>(&event)?;
         batch
             .write_batch
             .put_cf(&cf_events, event.key(), event_value.as_ref());
-        batch
-            .write_batch
-            .put_cf(&cf_by_pubkey, event.key_by_pubkey(), []);
 
         Ok(Some(event))
     }
 
     pub fn delete_event(&self, batch: &mut InternBatch, event: &EventRecord) {
-        let cf_events = cf!(self.db, EVENTS);
-        let cf_by_pubkey = cf!(self.db, EVENTS_BY_PUBKEY);
+        let cf_events = cf!(self.db, EVENTS_CF);
         batch.write_batch.delete_cf(&cf_events, event.key());
-        batch
-            .write_batch
-            .delete_cf(&cf_by_pubkey, event.key_by_pubkey());
+
+        if event.is_replaceable() {
+            let cf_replaceable = cf!(self.db, REPLACEABLE_CF);
+            batch
+                .write_batch
+                .delete_cf(&cf_replaceable, event.replaceable_key());
+        }
+        if event.is_addressable()
+            && let Some(key) = event.addressable_key()
+        {
+            let cf_addressable = cf!(self.db, ADDRESSABLE_CF);
+            batch.write_batch.delete_cf(&cf_addressable, key);
+        }
     }
 
     pub fn apply_updates(&self, inputs: &[PersistInputUpdate]) -> Result<()> {
@@ -240,38 +266,31 @@ impl PersistStore {
             .collect()
     }
 
-    fn find_replaceable_event(&self, event: &EventRecord) -> Result<Option<EventRecord>> {
-        let cf_by_pubkey = cf!(self.db, EVENTS_BY_PUBKEY);
+    fn find_replaceable(&self, event: &EventRecord) -> Result<Option<EventRecord>> {
+        let cf_replaceable = cf!(self.db, REPLACEABLE_CF);
+        let key = event.replaceable_key();
 
-        let prefix = event.key_by_pubkey_prefix();
-        let iter = self.db.prefix_iterator_cf(&cf_by_pubkey, prefix);
+        let Some(id_bytes) = self.db.get_cf(&cf_replaceable, key)? else {
+            return Ok(None);
+        };
 
-        let new_d = event.is_addressable().then(|| event.d_tag()).flatten();
+        let id = u32::from_be_bytes(id_bytes.try_into().unwrap());
+        self.get_event(id)
+    }
 
-        for item in iter {
-            let (key_bytes, _) = item?;
-            if !key_bytes.starts_with(&prefix) {
-                break;
-            }
-            if key_bytes.len() != 10 {
-                continue;
-            }
+    fn find_addressable(&self, event: &EventRecord) -> Result<Option<EventRecord>> {
+        let Some(key) = event.addressable_key() else {
+            return Ok(None);
+        };
 
-            let event_id =
-                u32::from_be_bytes([key_bytes[6], key_bytes[7], key_bytes[8], key_bytes[9]]);
+        let cf_addressable = cf!(self.db, ADDRESSABLE_CF);
 
-            let Some(found_event) = self.get_event(event_id)? else {
-                continue;
-            };
+        let Some(id_bytes) = self.db.get_cf(&cf_addressable, key)? else {
+            return Ok(None);
+        };
 
-            if event.is_addressable() && found_event.d_tag() != new_d {
-                continue;
-            }
-
-            return Ok(Some(found_event));
-        }
-
-        Ok(None)
+        let id = u32::from_be_bytes(id_bytes.try_into().unwrap());
+        self.get_event(id)
     }
 }
 
