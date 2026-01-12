@@ -17,6 +17,17 @@ pub struct EventRecord {
     pub tags: Vec<EventTag>,
 }
 
+impl From<&EventRecord> for EventRow {
+    fn from(row: &EventRecord) -> Self {
+        EventRow {
+            id: row.id,
+            pubkey: row.pubkey,
+            kind: row.kind,
+            created_at: row.created_at,
+        }
+    }
+}
+
 impl EventRecord {
     pub fn key(&self) -> [u8; 4] {
         self.id.to_be_bytes()
@@ -71,23 +82,6 @@ impl PersistStore {
         Ok(result)
     }
 
-    pub fn insert_events(&self, raw_events: &[EventRaw]) -> Result<usize> {
-        let mut intern_batch = InternBatch::new(&self.db);
-        let mut inserted_count = 0;
-
-        for raw_event in raw_events {
-            if self
-                .insert_event_internal(&mut intern_batch, raw_event)?
-                .is_some()
-            {
-                inserted_count += 1;
-            }
-        }
-
-        self.db.write(intern_batch.write_batch)?;
-        Ok(inserted_count)
-    }
-
     fn insert_event_internal(
         &self,
         batch: &mut InternBatch,
@@ -122,10 +116,7 @@ impl PersistStore {
                 return Ok(None);
             }
 
-            batch.write_batch.delete_cf(&cf_events, old_event.key());
-            batch
-                .write_batch
-                .delete_cf(&cf_by_pubkey, old_event.key_by_pubkey());
+            self.delete_event(batch, &old_event);
         }
 
         let event_value = to_bytes::<rancor::Error>(&event)?;
@@ -137,6 +128,42 @@ impl PersistStore {
             .put_cf(&cf_by_pubkey, event.key_by_pubkey(), []);
 
         Ok(Some(event))
+    }
+
+    pub fn delete_event(&self, batch: &mut InternBatch, event: &EventRecord) {
+        let cf_events = cf!(self.db, EVENTS);
+        let cf_by_pubkey = cf!(self.db, EVENTS_BY_PUBKEY);
+        batch.write_batch.delete_cf(&cf_events, event.key());
+        batch
+            .write_batch
+            .delete_cf(&cf_by_pubkey, event.key_by_pubkey());
+    }
+
+    pub fn apply_updates(&self, inputs: &[PersistInputUpdate]) -> Result<()> {
+        let mut batch = InternBatch::new(&self.db);
+        let mut notifications: Vec<PersistUpdate> = Vec::new();
+
+        for (event, ts, diff) in inputs {
+            if *diff > 0 {
+                if let Some(event) = self.insert_event_internal(&mut batch, event)? {
+                    notifications.push((event, *ts, 1));
+                }
+            } else if *diff < 0 {
+                let id = self.interner.intern_batch(&mut batch, &event.id)?;
+                if let Some(event) = self.get_event(id)? {
+                    self.delete_event(&mut batch, &event);
+                    notifications.push((event, *ts, -1));
+                }
+            }
+        }
+
+        self.db.write(batch.write_batch)?;
+
+        for (event, ts, diff) in notifications.drain(..) {
+            self.notify(event, ts, diff);
+        }
+
+        Ok(())
     }
 
     fn parse_and_intern_tags(
@@ -248,7 +275,7 @@ impl PersistStore {
     }
 }
 
-fn decode_hex32(hex_bytes: &[u8]) -> Option<[u8; 32]> {
+pub fn decode_hex32(hex_bytes: &[u8]) -> Option<[u8; 32]> {
     if hex_bytes.len() != 64 {
         return None;
     }
@@ -444,57 +471,50 @@ mod tests {
     }
 
     #[test]
-    fn assert_insert_events() {
+    fn assert_apply_updates() {
         let store = TestStore::new();
 
         let pubkey = [1u8; 32];
+        let ts = 0;
+        let diff = 1;
 
         let raw_events = vec![
-            EventRaw {
-                id: [2u8; 32],
-                pubkey,
-                kind: 1,
-                created_at: 1000,
-                tags_json: b"[]".to_vec(),
-            },
-            EventRaw {
-                id: [3u8; 32],
-                pubkey,
-                kind: 1,
-                created_at: 1001,
-                tags_json: b"[]".to_vec(),
-            },
-            EventRaw {
-                id: [4u8; 32],
-                pubkey,
-                kind: 1,
-                created_at: 1002,
-                tags_json: b"[]".to_vec(),
-            },
+            (
+                EventRaw {
+                    id: [2u8; 32],
+                    pubkey,
+                    kind: 1,
+                    created_at: 1000,
+                    tags_json: b"[]".to_vec(),
+                },
+                ts,
+                diff,
+            ),
+            (
+                EventRaw {
+                    id: [3u8; 32],
+                    pubkey,
+                    kind: 1,
+                    created_at: 1001,
+                    tags_json: b"[]".to_vec(),
+                },
+                ts,
+                diff,
+            ),
+            (
+                EventRaw {
+                    id: [4u8; 32],
+                    pubkey,
+                    kind: 1,
+                    created_at: 1002,
+                    tags_json: b"[]".to_vec(),
+                },
+                ts,
+                diff,
+            ),
         ];
 
-        let inserted = store.insert_events(&raw_events).unwrap();
-        assert_eq!(inserted, 3);
-
-        let events: Vec<_> = store.iter_events(PersistQuery::events()).collect();
-        assert_eq!(events.len(), 3);
-    }
-
-    #[test]
-    fn assert_iter_events() {
-        let store = TestStore::new();
-
-        let pubkey = [1u8; 32];
-        for i in 0..3u8 {
-            let event = EventRaw {
-                id: [i + 10; 32],
-                pubkey,
-                kind: 1,
-                created_at: 1000 + i as u64,
-                tags_json: b"[]".to_vec(),
-            };
-            store.insert_event(&event).unwrap();
-        }
+        store.apply_updates(&raw_events).unwrap();
 
         let events: Vec<_> = store.iter_events(PersistQuery::events()).collect();
         assert_eq!(events.len(), 3);

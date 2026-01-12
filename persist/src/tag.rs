@@ -17,22 +17,29 @@ pub enum EventTag {
     DTag(u32),
 }
 
-impl ArchivedEventTag {
-    pub fn target(&self) -> Option<u32_le> {
-        match self {
-            ArchivedEventTag::RootReply(id) => Some(*id),
-            ArchivedEventTag::Reply(id) => Some(*id),
-            ArchivedEventTag::Mention(id) => Some(*id),
-            ArchivedEventTag::Pubkey(id) => Some(*id),
-            ArchivedEventTag::PubkeyUpper(id) => Some(*id),
-            ArchivedEventTag::Quote(id) => Some(*id),
-            ArchivedEventTag::QuoteAddress { pubkey, .. } => Some(*pubkey),
-            ArchivedEventTag::Address { pubkey, .. } => Some(*pubkey),
-            ArchivedEventTag::EventReport(id) => Some(*id),
-            ArchivedEventTag::PubkeyReport(id) => Some(*id),
-            ArchivedEventTag::Hashtag(id) => Some(*id),
-            ArchivedEventTag::Bolt11(id) => Some(*id),
-            ArchivedEventTag::DTag(_) => None,
+macro_rules! impl_target {
+    ($ty:ty, $out:ty) => {
+        impl $ty {
+            pub fn target(&self) -> Option<$out> {
+                match self {
+                    Self::RootReply(id) => Some(*id),
+                    Self::Reply(id) => Some(*id),
+                    Self::Mention(id) => Some(*id),
+                    Self::Pubkey(id) => Some(*id),
+                    Self::PubkeyUpper(id) => Some(*id),
+                    Self::Quote(id) => Some(*id),
+                    Self::QuoteAddress { pubkey, .. } => Some(*pubkey),
+                    Self::Address { pubkey, .. } => Some(*pubkey),
+                    Self::EventReport(id) => Some(*id),
+                    Self::PubkeyReport(id) => Some(*id),
+                    Self::Hashtag(id) => Some(*id),
+                    Self::Bolt11(id) => Some(*id),
+                    Self::DTag(_) => None,
+                }
+            }
         }
-    }
+    };
 }
+
+impl_target!(EventTag, u32);
+impl_target!(ArchivedEventTag, u32_le);

@@ -1,8 +1,11 @@
 use anyhow::Result;
 use rocksdb::{ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options};
 use std::path::Path;
+use tokio::sync::broadcast;
+use types::event::EventRaw;
 
 use crate::{
+    event::EventRecord,
     interner::Interner,
     schema::{self},
 };
@@ -11,10 +14,14 @@ pub struct RocksDBConfig {
     pub max_total_wal_size: u64,
 }
 
+pub type PersistInputUpdate = (EventRaw, u64, i64);
+pub type PersistUpdate = (EventRecord, u64, i64);
+
 #[derive(Debug)]
 pub struct PersistStore {
     pub db: DBWithThreadMode<MultiThreaded>,
     pub interner: Interner,
+    updates_tx: broadcast::Sender<PersistUpdate>,
 }
 
 impl PersistStore {
@@ -34,8 +41,13 @@ impl PersistStore {
 
         let db = DBWithThreadMode::<MultiThreaded>::open_cf_descriptors(&options, path, cfs)?;
         let interner = Interner::new(&db)?;
+        let (updates_tx, _) = broadcast::channel(100_000);
 
-        Ok(PersistStore { db, interner })
+        Ok(PersistStore {
+            db,
+            interner,
+            updates_tx,
+        })
     }
 
     pub fn save_checkpoint(&self, checkpoint: u64) -> Result<()> {
@@ -61,6 +73,14 @@ impl PersistStore {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<PersistUpdate> {
+        self.updates_tx.subscribe()
+    }
+
+    pub fn notify(&self, event: EventRecord, ts: u64, diff: i64) {
+        let _ = self.updates_tx.send((event, ts, diff));
     }
 }
 
