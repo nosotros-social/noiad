@@ -1,7 +1,9 @@
 use clap::Parser;
 use core::algorithms::pagerank::pagerank;
+use core::algorithms::trusted_assertions::trusted_assertions;
 use core::config::Config;
 use core::operators::probe::{Handle, ProbeNotify};
+use core::operators::top_k::TopK;
 use core::sources::postgres::render;
 use core::{cli::Cli, sources::persist::persist_source::persist_source};
 use differential_dataflow::operators::CountTotal;
@@ -121,6 +123,26 @@ fn main() {
                         }
                     },
                 )
+                .probe_notify_with(vec![probe.clone()]);
+
+            let ta_events = events.filter(|e| {
+                !matches!(
+                    nostr_sdk::Kind::from_u16(e.kind),
+                    nostr_sdk::Kind::ContactList
+                )
+            });
+            let ta_collection = trusted_assertions(&ta_events, &follows, &ranks);
+
+            ta_collection
+                .map(|(pubkey, assertion)| (assertion.follower_cnt, pubkey, assertion))
+                .top_k(30)
+                .map(|(_follower_cnt, _pubkey, assertion)| assertion)
+                .inspect(|(assertion, _t, diff)| {
+                    if *diff > 0 {
+                        tracing::info!("trusted assertion: {:?}", assertion);
+                    }
+                })
+                .inner
                 .probe_notify_with(vec![probe.clone()]);
 
             edges

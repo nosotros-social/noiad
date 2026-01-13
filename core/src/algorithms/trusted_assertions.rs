@@ -1,20 +1,18 @@
-use std::str::FromStr;
-
+use differential_dataflow::operators::Threshold;
 use differential_dataflow::operators::join::Join;
 use differential_dataflow::{
     VecCollection,
     lattice::Lattice,
-    operators::{CountTotal, Reduce, Threshold},
+    operators::{CountTotal, Reduce},
 };
-use lightning_invoice::Bolt11Invoice;
 use nostr_sdk::Kind;
+use persist::event::EventRecord;
+use persist::tag::EventTag;
 use serde::{Deserialize, Serialize};
 use timely::{dataflow::Scope, order::TotalOrder};
+use types::event::{Edge, Node};
 
-use crate::{
-    event::{EdgeLabel, EventRow, Tag},
-    types::{Diff, Node},
-};
+use crate::types::Diff;
 
 macro_rules! trust_field {
     ($field:ident) => {
@@ -39,15 +37,15 @@ pub struct TrustedAssertion {
     pub post_cnt: Diff,
     pub reply_cnt: Diff,
     pub reactions_cnt: Diff,
-    pub zap_amt_recd: Diff,
-    pub zap_amt_sent: Diff,
+    pub zap_amt_recd: u64,
+    pub zap_amt_sent: u64,
     pub zap_cnt_recd: Diff,
     pub zap_cnt_sent: Diff,
-    pub zap_avg_amt_day_recd: Diff,
-    pub zap_avg_amt_day_sent: Diff,
+    pub zap_avg_amt_day_recd: u64,
+    pub zap_avg_amt_day_sent: u64,
     pub reports_cnt_sent: Diff,
     pub reports_cnt_recd: Diff,
-    pub topics: Vec<(Vec<u8>, Diff)>,
+    pub topics: Vec<(u32, Diff)>,
     pub active_hours_start: Option<u8>,
     pub active_hours_end: Option<u8>,
 }
@@ -81,8 +79,8 @@ pub fn normalize_pagerank(rank: Diff) -> Diff {
 /// NIP-85 implementation
 /// https://github.com/nostr-protocol/nips/blob/1ced632b45f603aca46a4741b54beea1b090388c/85.md
 pub fn trusted_assertions<G>(
-    events: &VecCollection<G, EventRow, Diff>,
-    edges: &VecCollection<G, (Kind, Node, Node, EdgeLabel), Diff>,
+    events: &VecCollection<G, EventRecord, Diff>,
+    edges_follows: &VecCollection<G, Edge, Diff>,
     ranks: &VecCollection<G, Node, Diff>,
 ) -> VecCollection<G, (Node, TrustedAssertion), Diff>
 where
@@ -93,11 +91,7 @@ where
     // ranks from 0 to 100
     let normalized_ranks = rank_totals.map(|(pk, rank)| (pk, normalize_pagerank(rank)));
 
-    let follower_cnt = edges
-        .filter(|&(kind, _, _, _)| kind == Kind::ContactList)
-        .filter(|&(_, _, _, label)| label == EdgeLabel::Pubkey)
-        .map(|(_, follower, followed, _)| (follower, followed))
-        // attach follower rank
+    let follower_cnt = edges_follows
         .join_map(&normalized_ranks, |_follower, &followed, &rank| {
             (followed, rank)
         })
@@ -146,68 +140,60 @@ where
         .map(|(pk, reply_cnt)| (pk, trust_field!(reply_cnt)));
 
     let reactions_cnt = events
-        .filter(|e| e.kind == Kind::Reaction)
+        .filter(|e| e.kind == Kind::Reaction.as_u16())
         .map(|e| e.pubkey)
         .count_total()
         .map(|(pk, reactions_cnt)| (pk, trust_field!(reactions_cnt)));
 
-    let zap_events = events.filter(|e| e.kind == Kind::ZapReceipt).flat_map(|e| {
-        let day = e.created_at / 86_400;
+    let zap_events = events
+        .filter(|e| e.kind == Kind::ZapReceipt.as_u16())
+        .flat_map(|e| {
+            let day = e.created_at / 86_400;
 
-        let mut sender: Option<Node> = None;
-        let mut recipient: Option<Node> = None;
-        let mut amount: Option<Diff> = None;
+            let mut sender: Option<Node> = None;
+            let mut recipient: Option<Node> = None;
+            let mut amount: Option<u64> = None;
 
-        for tag in &e.tags.0 {
-            match tag {
-                Tag::Pubkey {
-                    pubkey,
-                    uppercase: true,
-                } => {
-                    if sender.is_none() {
-                        sender = Some(*pubkey);
+            for tag in &e.tags {
+                match tag {
+                    EventTag::PubkeyUpper(pubkey) => {
+                        if sender.is_none() {
+                            sender = Some(*pubkey);
+                        }
                     }
-                }
-                Tag::Pubkey {
-                    pubkey,
-                    uppercase: false,
-                } => {
-                    if recipient.is_none() {
-                        recipient = Some(*pubkey);
+                    EventTag::Pubkey(pubkey) => {
+                        if recipient.is_none() {
+                            recipient = Some(*pubkey);
+                        }
                     }
-                }
-                Tag::Bolt11(bolt) => {
-                    if amount.is_none()
-                        && let Ok(s) = std::str::from_utf8(bolt.as_slice())
-                    {
-                        amount = parse_bolt11_amount_sats(s);
+                    EventTag::Bolt11(bolt_amount) => {
+                        amount = Some(*bolt_amount);
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
 
-        let amount = match amount {
-            Some(a) => a,
-            None => return None,
-        };
+            let amount = match amount {
+                Some(a) => a,
+                None => return None,
+            };
 
-        Some((sender, recipient, amount, day))
-    });
+            Some((sender, recipient, amount, day))
+        });
 
     let zap_amt_sent = zap_events
         .flat_map(|(sender_opt, _recipient_opt, amount, _day)| {
             sender_opt.map(|sender| (sender, amount))
         })
         .reduce(|_pk, vals, output| {
-            let mut total: Diff = 0;
+            let mut total: u64 = 0;
 
             for (amt, diff) in vals.iter() {
                 if *diff <= 0 {
                     continue;
                 }
 
-                total += *amt * *diff;
+                total = total.saturating_add(*amt * (*diff as u64));
             }
 
             if total != 0 {
@@ -221,14 +207,14 @@ where
             recipient_opt.map(|recipient| (recipient, amount))
         })
         .reduce(|_pk, vals, output| {
-            let mut total: Diff = 0;
+            let mut total: u64 = 0;
 
             for (amt, diff) in vals.iter() {
                 if *diff <= 0 {
                     continue;
                 }
 
-                total += *amt * *diff;
+                total = total.saturating_add(*amt * (*diff as u64));
             }
 
             if total != 0 {
@@ -252,14 +238,14 @@ where
             sender_opt.map(|sender| ((sender, day), amount))
         })
         .reduce(|_key, vals, output| {
-            let mut total: Diff = 0;
+            let mut total: u64 = 0;
 
             for (amt, diff) in vals.iter() {
                 if *diff <= 0 {
                     continue;
                 }
 
-                total += *amt * *diff;
+                total = total.saturating_add(*amt * (*diff as u64));
             }
 
             if total != 0 {
@@ -270,7 +256,7 @@ where
     let zap_avg_amt_day_sent = zap_sent_by_day
         .map(|((sender, _day), amount)| (sender, amount))
         .reduce(|_pk, vals, output| {
-            let mut total: Diff = 0;
+            let mut total: u64 = 0;
             let mut days: Diff = 0;
 
             for (amt, diff) in vals.iter() {
@@ -278,12 +264,12 @@ where
                     continue;
                 }
 
-                total += *amt * *diff;
+                total = total.saturating_add(*amt * (*diff as u64));
                 days += *diff;
             }
 
             if days > 0 {
-                let avg = total / days;
+                let avg = total / (days as u64);
                 if avg != 0 {
                     output.push((avg, 1));
                 }
@@ -296,14 +282,14 @@ where
             recipient_opt.map(|recipient| ((recipient, day), amount))
         })
         .reduce(|_key, vals, output| {
-            let mut total: Diff = 0;
+            let mut total: u64 = 0;
 
             for (amt, diff) in vals.iter() {
                 if *diff <= 0 {
                     continue;
                 }
 
-                total += *amt * *diff;
+                total = total.saturating_add(*amt * (*diff as u64));
             }
 
             if total != 0 {
@@ -314,7 +300,7 @@ where
     let zap_avg_amt_day_recd = zap_recd_by_day
         .map(|((recipient, _day), amount)| (recipient, amount))
         .reduce(|_pk, vals, output| {
-            let mut total: Diff = 0;
+            let mut total: u64 = 0;
             let mut days: Diff = 0;
 
             for (amt, diff) in vals.iter() {
@@ -322,12 +308,12 @@ where
                     continue;
                 }
 
-                total += *amt * *diff;
+                total = total.saturating_add(*amt * (*diff as u64));
                 days += *diff;
             }
 
             if days > 0 {
-                let avg = total / days;
+                let avg = total / (days as u64);
                 if avg != 0 {
                     output.push((avg, 1));
                 }
@@ -348,7 +334,6 @@ where
 
     let topic_counts = events
         .flat_map(|e| e.hashtags_for_author())
-        .map(|(pk, topic)| (pk, topic.as_slice().to_vec()))
         .count_total()
         .map(|((pk, topic_bytes), count)| (pk, (topic_bytes, count)))
         .map(|(pk, (topic_bytes, count))| {
@@ -437,83 +422,54 @@ where
                 continue;
             }
 
-            let r = row;
+            agg.follower_cnt += row.follower_cnt;
+            agg.post_cnt += row.post_cnt;
+            agg.reply_cnt += row.reply_cnt;
+            agg.reactions_cnt += row.reactions_cnt;
 
-            if r.follower_cnt != 0 {
-                agg.follower_cnt = r.follower_cnt;
-            }
+            agg.zap_amt_recd = agg.zap_amt_recd.saturating_add(row.zap_amt_recd);
+            agg.zap_amt_sent = agg.zap_amt_sent.saturating_add(row.zap_amt_sent);
 
-            if let Some(ts) = r.first_created_at {
+            agg.zap_cnt_recd += row.zap_cnt_recd;
+            agg.zap_cnt_sent += row.zap_cnt_sent;
+
+            agg.zap_avg_amt_day_recd = agg
+                .zap_avg_amt_day_recd
+                .saturating_add(row.zap_avg_amt_day_recd);
+            agg.zap_avg_amt_day_sent = agg
+                .zap_avg_amt_day_sent
+                .saturating_add(row.zap_avg_amt_day_sent);
+
+            agg.reports_cnt_sent += row.reports_cnt_sent;
+            agg.reports_cnt_recd += row.reports_cnt_recd;
+
+            if let Some(ts) = row.first_created_at {
                 agg.first_created_at = match agg.first_created_at {
                     None => Some(ts),
                     Some(cur) => Some(cur.min(ts)),
                 };
             }
 
-            if r.post_cnt != 0 {
-                agg.post_cnt = r.post_cnt;
+            if let Some(rank) = row.rank {
+                agg.rank = Some(rank);
             }
 
-            if r.reply_cnt != 0 {
-                agg.reply_cnt = r.reply_cnt;
+            if !row.topics.is_empty() {
+                agg.topics.extend(row.topics.iter().cloned());
             }
 
-            if r.reactions_cnt != 0 {
-                agg.reactions_cnt = r.reactions_cnt;
-            }
-
-            if r.zap_amt_recd != 0 {
-                agg.zap_amt_recd = r.zap_amt_recd;
-            }
-
-            if r.zap_amt_sent != 0 {
-                agg.zap_amt_sent = r.zap_amt_sent;
-            }
-
-            if r.zap_cnt_recd != 0 {
-                agg.zap_cnt_recd = r.zap_cnt_recd;
-            }
-
-            if r.zap_cnt_sent != 0 {
-                agg.zap_cnt_sent = r.zap_cnt_sent;
-            }
-
-            if r.zap_avg_amt_day_recd != 0 {
-                agg.zap_avg_amt_day_recd = r.zap_avg_amt_day_recd;
-            }
-
-            if r.zap_avg_amt_day_sent != 0 {
-                agg.zap_avg_amt_day_sent = r.zap_avg_amt_day_sent;
-            }
-
-            if r.reports_cnt_sent != 0 {
-                agg.reports_cnt_sent = r.reports_cnt_sent;
-            }
-
-            if r.reports_cnt_recd != 0 {
-                agg.reports_cnt_recd = r.reports_cnt_recd;
-            }
-
-            if !r.topics.is_empty() {
-                agg.topics.extend(r.topics.iter().cloned());
-            }
-
-            if let Some(h) = r.active_hours_start {
+            if let Some(h) = row.active_hours_start {
                 agg.active_hours_start = match agg.active_hours_start {
                     None => Some(h),
                     Some(cur) => Some(cur.min(h)),
                 };
             }
 
-            if let Some(h) = r.active_hours_end {
+            if let Some(h) = row.active_hours_end {
                 agg.active_hours_end = match agg.active_hours_end {
                     None => Some(h),
                     Some(cur) => Some(cur.max(h)),
                 };
-            }
-
-            if let Some(rank) = r.rank {
-                agg.rank = Some(rank);
             }
         }
 
@@ -521,86 +477,52 @@ where
     })
 }
 
-fn parse_bolt11_amount_sats(bolt11: &str) -> Option<Diff> {
-    let invoice = Bolt11Invoice::from_str(bolt11).ok()?;
-    let msat = invoice.amount_milli_satoshis()?;
-    let sats = msat / 1000;
-    Some(sats as Diff)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use compact_bytes::CompactBytes;
     use differential_dataflow::input::InputSession;
+    use persist::edges::EdgeLabel;
+    use persist::tag::EventTag;
+    use std::sync::mpsc::channel;
     use timely::dataflow::operators::Capture;
     use timely::dataflow::operators::capture::Extract;
     use timely::dataflow::operators::probe::Handle as ProbeHandle;
     use timely::execute_directly;
 
     use crate::algorithms::pagerank::pagerank;
-    use crate::event::{EventRow, Marker, Tag, Tags};
-    use crate::types::{Diff, Node};
+    use crate::types::Diff;
 
-    const PUBKEY1: Node = [1u8; 32];
-    const PUBKEY2: Node = [2u8; 32];
-    const PUBKEY3: Node = [3u8; 32];
-    const PUBKEY4: Node = [4u8; 32];
-    const PUBKEY5: Node = [5u8; 32];
-    const PUBKEY_LN: Node = [9u8; 32];
+    const PUBKEY1: Node = 1;
+    const PUBKEY2: Node = 2;
+    const PUBKEY3: Node = 3;
+    const PUBKEY4: Node = 4;
+    const PUBKEY5: Node = 5;
+    const PUBKEY_LN: Node = 9;
 
-    use core::time::Duration;
-    use lightning::bitcoin::hashes::{Hash as _, sha256};
-    use lightning::bitcoin::secp256k1::{Secp256k1, SecretKey};
-    use lightning::bolt11_invoice::{Currency, InvoiceBuilder};
-    use lightning::types::payment::{PaymentHash, PaymentSecret};
-    use std::sync::mpsc::channel;
-
-    fn build_bolt11(sats: u64) -> String {
-        let secp = Secp256k1::new();
-        let node_secret_key = SecretKey::from_slice(&[42u8; 32]).unwrap();
-        let payment_hash = PaymentHash([0u8; 32]);
-        let payment_secret = PaymentSecret([1u8; 32]);
-        let payment_hash_sha256 = sha256::Hash::from_slice(&payment_hash.0).unwrap();
-        let amount_msat = sats * 1000;
-
-        let builder = InvoiceBuilder::new(Currency::Bitcoin)
-            .description("test zap".to_string())
-            .payment_hash(payment_hash_sha256)
-            .payment_secret(payment_secret)
-            .duration_since_epoch(Duration::from_secs(1_700_000_000))
-            .min_final_cltv_expiry_delta(144)
-            .amount_milli_satoshis(amount_msat);
-
-        let invoice = builder
-            .build_signed(|msg| secp.sign_ecdsa_recoverable(msg, &node_secret_key))
-            .unwrap();
-
-        invoice.to_string()
-    }
+    const HASHTAG_NOSTR: u32 = 400;
+    const HASHTAG_WOT: u32 = 401;
 
     fn build_dataflow<FBuild>(build_inputs: FBuild) -> Vec<(Node, TrustedAssertion, u64, Diff)>
     where
-        FBuild: FnOnce(&mut InputSession<u64, EventRow, Diff>) + Send + Sync + 'static,
+        FBuild: FnOnce(&mut InputSession<u64, EventRecord, Diff>) + Send + Sync + 'static,
     {
         let (tx, rx) = channel();
 
         execute_directly(move |worker| {
-            let mut events_input: InputSession<u64, EventRow, Diff> = InputSession::new();
+            let mut events_input: InputSession<u64, EventRecord, Diff> = InputSession::new();
             let probe = ProbeHandle::new();
 
             worker.dataflow::<u64, _, _>(|scope| {
                 let events = events_input.to_collection(scope);
-                let edges = events.flat_map(|e| e.to_edges());
-                let ranks = pagerank(
-                    20,
-                    &edges
-                        .filter(|&(kind, _, _, _)| kind == Kind::ContactList)
-                        .filter(|&(_, _, _, label)| label == EdgeLabel::Pubkey)
-                        .map(|(_, from, to, _)| (from, to)),
-                );
+                let follows = events
+                    .flat_map(|e| e.to_edges())
+                    .filter(|&(kind, _, _, _)| kind == Kind::ContactList.as_u16())
+                    .filter(|&(_, _, _, label)| label == EdgeLabel::Pubkey)
+                    .map(|(_, from, to, _)| (from, to));
 
-                let assertions = trusted_assertions(&events, &edges, &ranks);
+                let ranks = pagerank(20, &follows);
+
+                let assertions = trusted_assertions(&events, &follows, &ranks);
 
                 assertions.probe_with(&probe).inner.capture_into(tx);
             });
@@ -649,183 +571,135 @@ mod tests {
     fn assert_trusted_assertions_for_pubkey() {
         let captured = build_dataflow(|events_input| {
             // Follow events
-            events_input.insert(EventRow {
-                id: [30u8; 32],
+            events_input.insert(EventRecord {
+                id: 30,
                 pubkey: PUBKEY1,
                 created_at: 2 * 3600,
-                kind: Kind::ContactList,
-                tags: Tags(vec![Tag::Pubkey {
-                    pubkey: PUBKEY2,
-                    uppercase: false,
-                }]),
+                kind: Kind::ContactList.as_u16(),
+                tags: vec![EventTag::Pubkey(PUBKEY2)],
             });
-            events_input.insert(EventRow {
-                id: [31u8; 32],
+            events_input.insert(EventRecord {
+                id: 31,
                 pubkey: PUBKEY2,
                 created_at: 10 * 3600,
-                kind: Kind::ContactList,
-                tags: Tags(vec![Tag::Pubkey {
-                    pubkey: PUBKEY1,
-                    uppercase: false,
-                }]),
+                kind: Kind::ContactList.as_u16(),
+                tags: vec![EventTag::Pubkey(PUBKEY1)],
             });
-            events_input.insert(EventRow {
-                id: [32u8; 32],
+            events_input.insert(EventRecord {
+                id: 32,
                 pubkey: PUBKEY3,
                 created_at: 7 * 3600,
-                kind: Kind::ContactList,
-                tags: Tags(vec![Tag::Pubkey {
-                    pubkey: PUBKEY1,
-                    uppercase: false,
-                }]),
+                kind: Kind::ContactList.as_u16(),
+                tags: vec![EventTag::Pubkey(PUBKEY1)],
             });
 
             // pubkey1 root posts
-            events_input.insert(EventRow {
-                id: [10u8; 32],
+            events_input.insert(EventRecord {
+                id: 10,
                 pubkey: PUBKEY1,
                 created_at: 3600,
-                kind: Kind::TextNote,
-                tags: Tags(vec![Tag::Hashtag(CompactBytes::new(b"nostr"))]),
+                kind: Kind::TextNote.as_u16(),
+                tags: vec![EventTag::Hashtag(HASHTAG_NOSTR)],
             });
-            events_input.insert(EventRow {
-                id: [11u8; 32],
+            events_input.insert(EventRecord {
+                id: 11,
                 pubkey: PUBKEY1,
                 created_at: 3 * 3600,
-                kind: Kind::TextNote,
-                tags: Tags(vec![Tag::Hashtag(CompactBytes::new(b"wot"))]),
+                kind: Kind::TextNote.as_u16(),
+                tags: vec![EventTag::Hashtag(HASHTAG_WOT)],
             });
 
             // pubkey1 replies at hour 20
-            events_input.insert(EventRow {
-                id: [12u8; 32],
+            events_input.insert(EventRecord {
+                id: 12,
                 pubkey: PUBKEY1,
                 created_at: 20 * 3600,
-                kind: Kind::TextNote,
-                tags: Tags(vec![Tag::Event {
-                    id: [9u8; 32],
-                    marker: Some(Marker::Reply),
-                }]),
+                kind: Kind::TextNote.as_u16(),
+                tags: vec![EventTag::Reply(9)],
             });
 
             // pubkey1 reacts to note 10 from pubkey1
-            events_input.insert(EventRow {
-                id: [13u8; 32],
+            events_input.insert(EventRecord {
+                id: 13,
                 pubkey: PUBKEY1,
                 created_at: 21 * 3600,
-                kind: Kind::Reaction,
-                tags: Tags(vec![
-                    Tag::Event {
-                        id: [10u8; 32],
-                        marker: None,
-                    },
-                    Tag::Pubkey {
-                        pubkey: PUBKEY1,
-                        uppercase: false,
-                    },
-                ]),
+                kind: Kind::Reaction.as_u16(),
+                tags: vec![EventTag::Mention(10), EventTag::Pubkey(PUBKEY1)],
             });
 
             // pubkey1 reacts to note 11 from pubkey1
-            events_input.insert(EventRow {
-                id: [14u8; 32],
+            events_input.insert(EventRecord {
+                id: 14,
                 pubkey: PUBKEY1,
                 created_at: 22 * 3600,
-                kind: Kind::Reaction,
-                tags: Tags(vec![
-                    Tag::Event {
-                        id: [11u8; 32],
-                        marker: None,
-                    },
-                    Tag::Pubkey {
-                        pubkey: PUBKEY1,
-                        uppercase: false,
-                    },
-                ]),
+                kind: Kind::Reaction.as_u16(),
+                tags: vec![EventTag::Mention(11), EventTag::Pubkey(PUBKEY1)],
             });
 
             // pubkey1 reports pubkey2
-            events_input.insert(EventRow {
-                id: [15u8; 32],
+            events_input.insert(EventRecord {
+                id: 15,
                 pubkey: PUBKEY1,
                 created_at: 23 * 3600,
-                kind: Kind::Reporting,
-                tags: Tags(vec![Tag::PubkeyReport(PUBKEY2)]),
+                kind: Kind::Reporting.as_u16(),
+                tags: vec![EventTag::PubkeyReport(PUBKEY2)],
             });
 
-            events_input.insert(EventRow {
-                id: [16u8; 32],
+            events_input.insert(EventRecord {
+                id: 16,
                 pubkey: PUBKEY2,
                 created_at: 5 * 3600,
-                kind: Kind::TextNote,
-                tags: Tags(vec![Tag::Pubkey {
-                    pubkey: PUBKEY1,
-                    uppercase: false,
-                }]),
+                kind: Kind::TextNote.as_u16(),
+                tags: vec![EventTag::Pubkey(PUBKEY1)],
             });
 
-            events_input.insert(EventRow {
-                id: [17u8; 32],
+            events_input.insert(EventRecord {
+                id: 17,
                 pubkey: PUBKEY3,
                 created_at: 6 * 3600,
-                kind: Kind::TextNote,
-                tags: Tags(vec![Tag::Pubkey {
-                    pubkey: PUBKEY1,
-                    uppercase: false,
-                }]),
+                kind: Kind::TextNote.as_u16(),
+                tags: vec![EventTag::Pubkey(PUBKEY1)],
             });
 
-            events_input.insert(EventRow {
-                id: [18u8; 32],
+            events_input.insert(EventRecord {
+                id: 18,
                 pubkey: PUBKEY3,
                 created_at: 7 * 3600,
-                kind: Kind::TextNote,
-                tags: Tags(vec![]),
+                kind: Kind::TextNote.as_u16(),
+                tags: vec![],
             });
 
-            events_input.insert(EventRow {
-                id: [19u8; 32],
+            events_input.insert(EventRecord {
+                id: 19,
                 pubkey: PUBKEY3,
                 created_at: 8 * 3600,
-                kind: Kind::Reaction,
-                tags: Tags(vec![]),
+                kind: Kind::Reaction.as_u16(),
+                tags: vec![],
             });
 
             // pubkey1 zaps pubkey2 1000 sats
-            events_input.insert(EventRow {
-                id: [20u8; 32],
+            events_input.insert(EventRecord {
+                id: 20,
                 pubkey: PUBKEY_LN,
                 created_at: 9 * 3600,
-                kind: Kind::ZapReceipt,
-                tags: Tags(vec![
-                    Tag::Pubkey {
-                        pubkey: PUBKEY2,
-                        uppercase: false,
-                    },
-                    Tag::Pubkey {
-                        pubkey: PUBKEY1,
-                        uppercase: true,
-                    },
-                    Tag::Bolt11(CompactBytes::new(build_bolt11(1000).as_bytes())),
-                ]),
+                kind: Kind::ZapReceipt.as_u16(),
+                tags: vec![
+                    EventTag::Pubkey(PUBKEY2),
+                    EventTag::PubkeyUpper(PUBKEY1),
+                    EventTag::Bolt11(1000),
+                ],
             });
             // pubkey2 zaps pubkey1 2000 sats
-            events_input.insert(EventRow {
-                id: [21u8; 32],
+            events_input.insert(EventRecord {
+                id: 21,
                 pubkey: PUBKEY_LN,
                 created_at: 10 * 3600,
-                kind: Kind::ZapReceipt,
-                tags: Tags(vec![
-                    Tag::Pubkey {
-                        pubkey: PUBKEY1,
-                        uppercase: false,
-                    },
-                    Tag::Pubkey {
-                        pubkey: PUBKEY2,
-                        uppercase: true,
-                    },
-                    Tag::Bolt11(CompactBytes::new(build_bolt11(2000).as_bytes())),
-                ]),
+                kind: Kind::ZapReceipt.as_u16(),
+                tags: vec![
+                    EventTag::Pubkey(PUBKEY1),
+                    EventTag::PubkeyUpper(PUBKEY2),
+                    EventTag::Bolt11(2000),
+                ],
             });
         });
 
@@ -846,7 +720,7 @@ mod tests {
             let mut topics = res1.topics.clone();
             topics.sort();
 
-            let mut expected_topics = vec![(b"wot".to_vec(), 1), (b"nostr".to_vec(), 1)];
+            let mut expected_topics = vec![(HASHTAG_WOT, 1), (HASHTAG_NOSTR, 1)];
             expected_topics.sort();
 
             let expected = TrustedAssertion {
@@ -920,76 +794,58 @@ mod tests {
     #[test]
     fn assert_follow_edges_inserts_and_deletes() {
         let captured = build_dataflow(|events_input| {
-            events_input.insert(EventRow {
-                id: [1u8; 32],
+            events_input.insert(EventRecord {
+                id: 1,
                 pubkey: PUBKEY2,
                 created_at: 2000,
-                kind: Kind::ContactList,
-                tags: Tags(vec![Tag::Pubkey {
-                    pubkey: PUBKEY1,
-                    uppercase: false,
-                }]),
+                kind: Kind::ContactList.as_u16(),
+                tags: vec![EventTag::Pubkey(PUBKEY1)],
             });
 
-            events_input.insert(EventRow {
-                id: [2u8; 32],
+            events_input.insert(EventRecord {
+                id: 2,
                 pubkey: PUBKEY1,
                 created_at: 2000,
-                kind: Kind::ContactList,
-                tags: Tags(vec![Tag::Pubkey {
-                    pubkey: PUBKEY2,
-                    uppercase: false,
-                }]),
+                kind: Kind::ContactList.as_u16(),
+                tags: vec![EventTag::Pubkey(PUBKEY2)],
             });
 
-            events_input.insert(EventRow {
-                id: [3u8; 32],
+            events_input.insert(EventRecord {
+                id: 3,
                 pubkey: PUBKEY3,
                 created_at: 2000,
-                kind: Kind::ContactList,
-                tags: Tags(vec![Tag::Pubkey {
-                    pubkey: PUBKEY4,
-                    uppercase: false,
-                }]),
+                kind: Kind::ContactList.as_u16(),
+                tags: vec![EventTag::Pubkey(PUBKEY4)],
             });
-            events_input.insert(EventRow {
-                id: [4u8; 32],
+            events_input.insert(EventRecord {
+                id: 4,
                 pubkey: PUBKEY4,
                 created_at: 2000,
-                kind: Kind::ContactList,
-                tags: Tags(vec![Tag::Pubkey {
-                    pubkey: PUBKEY5,
-                    uppercase: false,
-                }]),
+                kind: Kind::ContactList.as_u16(),
+                tags: vec![EventTag::Pubkey(PUBKEY5)],
             });
             events_input.flush();
 
             // pubkey1 unfollows pubkey2 at timestamp 2
             events_input.advance_to(2);
-            events_input.remove(EventRow {
-                id: [2u8; 32],
+            events_input.remove(EventRecord {
+                id: 2,
                 pubkey: PUBKEY1,
                 created_at: 2000,
-                kind: Kind::ContactList,
-                tags: Tags(vec![Tag::Pubkey {
-                    pubkey: PUBKEY2,
-                    uppercase: false,
-                }]),
+                kind: Kind::ContactList.as_u16(),
+                tags: vec![EventTag::Pubkey(PUBKEY2)],
             });
             events_input.flush();
 
             // pubkey1 follows pubkey2 again at timestamp 3
             events_input.advance_to(3);
 
-            events_input.insert(EventRow {
-                id: [4u8; 32],
+            events_input.insert(EventRecord {
+                id: 4,
                 pubkey: PUBKEY1,
                 created_at: 4000,
-                kind: Kind::ContactList,
-                tags: Tags(vec![Tag::Pubkey {
-                    pubkey: PUBKEY2,
-                    uppercase: false,
-                }]),
+                kind: Kind::ContactList.as_u16(),
+                tags: vec![EventTag::Pubkey(PUBKEY2)],
             });
 
             events_input.flush();
@@ -1027,17 +883,17 @@ mod tests {
         assert_eq!(normalize_pagerank(600_000_000 as Diff), 90);
     }
 
-    const PUBKEY_NO_EVENTS: Node = [7u8; 32];
+    const PUBKEY_NO_EVENTS: Node = 7;
 
     #[test]
     fn assert_pubkey_without_events() {
         let captured = build_dataflow(|events_input| {
-            events_input.insert(EventRow {
-                id: [42u8; 32],
+            events_input.insert(EventRecord {
+                id: 42,
                 pubkey: PUBKEY1,
                 created_at: 1_000,
-                kind: Kind::Reporting,
-                tags: Tags(vec![Tag::PubkeyReport(PUBKEY_NO_EVENTS)]),
+                kind: Kind::Reporting.as_u16(),
+                tags: vec![EventTag::PubkeyReport(PUBKEY_NO_EVENTS)],
             });
         });
 
