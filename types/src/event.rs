@@ -3,7 +3,8 @@ use std::fmt::Display;
 use serde::{Deserialize, Serialize};
 
 pub type Node = u32;
-pub type Edge = (u32, u32);
+pub type Kind = u16;
+pub type Edge = (Node, Node);
 pub type DiffRow = u64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialOrd, PartialEq, Eq, Ord)]

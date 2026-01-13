@@ -1,14 +1,18 @@
 use anyhow::Result;
+use lightning_invoice::Bolt11Invoice;
+use nostr_sdk::Kind;
 use rkyv::{Archive, from_bytes, to_bytes};
 use rkyv::{Deserialize, Serialize, rancor};
-use types::event::{EventRaw, EventRow};
+use std::str::FromStr;
+use types::event::{EventRaw, EventRow, Node};
 
 use crate::db::{PersistInputUpdate, PersistStore, PersistUpdate};
 use crate::interner::InternBatch;
+use crate::iter::EventEdges;
 use crate::schema::{ADDRESSABLE_CF, EVENTS_CF, REPLACEABLE_CF, cf};
 use crate::tag::EventTag;
 
-#[derive(Archive, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Archive, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Ord, PartialOrd)]
 pub struct EventRecord {
     pub id: u32,
     pub pubkey: u32,
@@ -61,6 +65,62 @@ impl EventRecord {
         self.tags.iter().find_map(|e| match e {
             EventTag::DTag(d) => Some(*d),
             _ => None,
+        })
+    }
+
+    #[inline]
+    pub fn to_edges(self) -> EventEdges {
+        EventEdges {
+            kind: self.kind,
+            from: self.pubkey,
+            tags: self.tags.into_iter(),
+        }
+    }
+
+    #[inline]
+    pub fn is_note(&self) -> bool {
+        self.kind == Kind::TextNote.as_u16()
+    }
+
+    #[inline]
+    pub fn is_reply(&self) -> bool {
+        if self.kind == Kind::Comment.as_u16() {
+            return true;
+        }
+        self.tags
+            .iter()
+            .any(|tag| matches!(tag, EventTag::Reply(_) | EventTag::RootReply(_)))
+    }
+
+    pub fn is_root_post(&self) -> bool {
+        self.is_note() && !self.is_reply()
+    }
+
+    pub fn has_report(&self) -> bool {
+        self.tags
+            .iter()
+            .any(|tag| matches!(tag, EventTag::EventReport(_) | EventTag::PubkeyReport(_)))
+    }
+
+    pub fn hashtags_for_author(self) -> impl Iterator<Item = (Node, Node)> {
+        let author = self.pubkey;
+
+        self.tags.into_iter().filter_map(move |tag| {
+            let EventTag::Hashtag(topic) = tag else {
+                return None;
+            };
+
+            Some((author, topic))
+        })
+    }
+
+    pub fn reported_pubkeys(self) -> impl Iterator<Item = Node> {
+        self.tags.into_iter().filter_map(|tag| {
+            let EventTag::PubkeyReport(pk) = tag else {
+                return None;
+            };
+
+            Some(pk)
         })
     }
 }
@@ -569,7 +629,7 @@ mod tests {
 
         store.apply_updates(&raw_events).unwrap();
 
-        let events: Vec<_> = store.iter_events(PersistQuery::events()).collect();
+        let events: Vec<_> = store.iter_events(PersistQuery::default()).collect();
         assert_eq!(events.len(), 3);
     }
 

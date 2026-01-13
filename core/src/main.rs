@@ -5,7 +5,9 @@ use core::operators::probe::{Handle, ProbeNotify};
 use core::sources::postgres::render;
 use core::{cli::Cli, sources::persist::persist_source::persist_source};
 use differential_dataflow::operators::CountTotal;
+use nostr_sdk::Kind;
 use persist::db::PersistStore;
+use persist::edges::EdgeLabel;
 use persist::query::PersistQuery;
 use std::sync::Arc;
 use timely::dataflow::operators::Exchange;
@@ -63,20 +65,27 @@ fn main() {
             let events = persist_source(
                 scope,
                 config.clone(),
-                PersistQuery::events(),
+                PersistQuery::default().kinds(vec![
+                    Kind::ContactList.as_u16(),
+                    Kind::TextNote.as_u16(),
+                    Kind::Repost.as_u16(),
+                    Kind::Reaction.as_u16(),
+                    Kind::Reporting.as_u16(),
+                    Kind::ZapReceipt.as_u16(),
+                ]),
                 &persisted_done,
                 &probe,
             );
 
-            let edges = persist_source(
-                scope,
-                config.clone(),
-                PersistQuery::edges(),
-                &persisted_done,
-                &probe,
-            );
+            let edges = events.flat_map(|e| e.to_edges());
 
-            let ranks = pagerank(cli.pagerank_iterations, &edges).consolidate();
+            let follows = edges
+                .filter(|(kind, _, _, label)| {
+                    *kind == Kind::ContactList.as_u16() && *label == EdgeLabel::Pubkey
+                })
+                .map(|(_, src, dst, _)| (src, dst));
+
+            let ranks = pagerank(cli.pagerank_iterations, &follows).consolidate();
 
             ranks
                 .inner

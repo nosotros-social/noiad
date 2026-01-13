@@ -1,6 +1,7 @@
 use anyhow::Error;
 use differential_dataflow::{AsCollection, Data, VecCollection};
 use futures::StreamExt;
+use persist::event::EventRecord;
 use persist::iter::PersistQueryIter;
 use timely::Container;
 use timely::container::CapacityContainerBuilder;
@@ -19,7 +20,7 @@ pub fn persist_source<G, D, Q>(
     query: Q,
     start_stream: &StreamCore<G, D>,
     probe: &Handle<u64>,
-) -> VecCollection<G, Q::Item, Diff>
+) -> VecCollection<G, EventRecord, Diff>
 where
     G: Scope<Timestamp = u64>,
     D: Container + Data,
@@ -30,7 +31,7 @@ where
     let mut signal_input = builder.new_disconnected_input(start_stream, Pipeline);
 
     let (event_handle, event_stream) =
-        builder.new_output::<CapacityContainerBuilder<Vec<(Q::Item, u64, Diff)>>>();
+        builder.new_output::<CapacityContainerBuilder<Vec<(EventRecord, u64, Diff)>>>();
 
     let probe = probe.clone();
 
@@ -78,10 +79,7 @@ where
                         }
 
                         max_ts = max_ts.max(ts);
-
-                        for item in query.iter_updates(&event) {
-                            event_handle.give(&event_cap[0], (item, ts, diff as Diff));
-                        }
+                        event_handle.give(&event_cap[0], (event, ts, diff as Diff));
 
                         if subscription.is_empty() {
                             tracing::info!(
