@@ -6,9 +6,14 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 hex = "0.4.3"
+lightning-invoice = "0.34.0"
+nostr-sdk = "0.44.1"
 rkyv = "0.8.12"
 rocksdb = { version = "0.24", features = ["lz4"] }
 serde = "1.0.228"
 serde_json = "1.0.148"
 tokio = { version = "1.49.0", features = ["sync"] }
 types = { version = "0.1.0", path = "../types" }
+
+[dev-dependencies]
+lightning = "0.2.0"

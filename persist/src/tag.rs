@@ -13,7 +13,7 @@ pub enum EventTag {
     EventReport(u32),
     PubkeyReport(u32),
     Hashtag(u32),
-    Bolt11(u32),
+    Bolt11(u64),
     DTag(u32),
 }
 

@@ -252,10 +252,15 @@ impl PersistStore {
                         .interner
                         .intern_batch(batch, value.as_bytes())
                         .map(EventTag::DTag),
-                    "bolt11" => self
-                        .interner
-                        .intern_batch(batch, value.as_bytes())
-                        .map(EventTag::Bolt11),
+
+                    "bolt11" => {
+                        let invoice = Bolt11Invoice::from_str(value).ok()?;
+                        let amount_sats = invoice
+                            .amount_milli_satoshis()
+                            .map(|msat| msat / 1000)
+                            .unwrap_or(0);
+                        Ok(EventTag::Bolt11(amount_sats))
+                    }
                     _ => {
                         return None;
                     }
@@ -326,9 +331,38 @@ fn parse_address(
 
 #[cfg(test)]
 mod tests {
+    use crate::helpers::TestStore;
+    use crate::query::PersistQuery;
+    use crate::tag::EventTag;
+    use lightning::bitcoin::hashes::{Hash as _, sha256};
+    use lightning::bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use lightning::bolt11_invoice::{Currency, InvoiceBuilder};
+    use lightning::types::payment::{PaymentHash, PaymentSecret};
+    use std::time::Duration;
     use types::event::EventRaw;
 
-    use crate::{helpers::TestStore, query::PersistQuery};
+    fn build_bolt11(sats: u64) -> String {
+        let secp = Secp256k1::new();
+        let node_secret_key = SecretKey::from_slice(&[42u8; 32]).unwrap();
+        let payment_hash = PaymentHash([0u8; 32]);
+        let payment_secret = PaymentSecret([1u8; 32]);
+        let payment_hash_sha256 = sha256::Hash::from_slice(&payment_hash.0).unwrap();
+        let amount_msat = sats * 1000;
+
+        let builder = InvoiceBuilder::new(Currency::Bitcoin)
+            .description("test zap".to_string())
+            .payment_hash(payment_hash_sha256)
+            .payment_secret(payment_secret)
+            .duration_since_epoch(Duration::from_secs(1_700_000_000))
+            .min_final_cltv_expiry_delta(144)
+            .amount_milli_satoshis(amount_msat);
+
+        let invoice = builder
+            .build_signed(|msg| secp.sign_ecdsa_recoverable(msg, &node_secret_key))
+            .unwrap();
+
+        invoice.to_string()
+    }
 
     #[test]
     fn assert_get_event_not_found() {
@@ -537,5 +571,56 @@ mod tests {
 
         let events: Vec<_> = store.iter_events(PersistQuery::events()).collect();
         assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn assert_bolt11_tag_stores_sats() {
+        let store = TestStore::new();
+
+        let sats = 21_000u64;
+        let invoice = build_bolt11(sats);
+
+        let raw = EventRaw {
+            id: [9u8; 32],
+            pubkey: [8u8; 32],
+            kind: 1,
+            created_at: 1000,
+            tags_json: format!("[[\"bolt11\",\"{invoice}\"]]").into_bytes(),
+        };
+
+        let event = store.insert_event(&raw).unwrap().unwrap();
+        let stored = store.get_event(event.id).unwrap().unwrap();
+
+        let mut found = None;
+        for tag in stored.tags {
+            if let EventTag::Bolt11(amount) = tag {
+                found = Some(amount);
+                break;
+            }
+        }
+
+        assert_eq!(found, Some(sats));
+    }
+
+    #[test]
+    fn assert_invalid_bolt11_is_ignored() {
+        let store = TestStore::new();
+
+        let raw = EventRaw {
+            id: [7u8; 32],
+            pubkey: [6u8; 32],
+            kind: 1,
+            created_at: 1000,
+            tags_json: b"[[\"bolt11\",\"not-a-real-invoice\"]]".to_vec(),
+        };
+
+        let event = store.insert_event(&raw).unwrap().unwrap();
+        let stored = store.get_event(event.id).unwrap().unwrap();
+
+        for tag in stored.tags {
+            if let EventTag::Bolt11(_) = tag {
+                panic!("invalid bolt11 should not produce EventTag::Bolt11");
+            }
+        }
     }
 }
