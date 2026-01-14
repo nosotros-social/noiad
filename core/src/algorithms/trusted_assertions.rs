@@ -345,11 +345,6 @@ where
     //     })
     //     .map(|(pk, topics)| (pk, TrustedPart::Topics(topics)));
 
-    let by_hour = events.map(|e| {
-        let hour = ((e.created_at / 3600) % 24) as u8;
-        (e.pubkey, hour)
-    });
-
     let active_hours = events
         .map(|e| {
             let hour = ((e.created_at / 3600) % 24) as u8;

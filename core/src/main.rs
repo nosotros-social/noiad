@@ -1,7 +1,7 @@
 use clap::Parser;
 use core::algorithms::pagerank::pagerank;
 use core::algorithms::trusted_assertions::trusted_assertions;
-use core::algorithms::trusted_assertions_event::{self, event_assertions_event};
+use core::algorithms::trusted_assertions_event::event_assertions_event;
 use core::config::Config;
 use core::operators::probe::{Handle, ProbeNotify};
 use core::operators::top_k::TopK;
@@ -150,7 +150,7 @@ fn main() {
                 .probe_notify_with(vec![probe.clone()]);
 
             ta_events_collection
-                .map(|(pubkey, assertion)| (assertion.rank, assertion))
+                .map(|(_pubkey, assertion)| (assertion.rank, assertion))
                 .top_k(5)
                 .map(|(_rank, assertion)| assertion)
                 .inspect(|(assertion, _t, diff)| {
