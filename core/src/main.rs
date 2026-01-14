@@ -1,6 +1,7 @@
 use clap::Parser;
 use core::algorithms::pagerank::pagerank;
 use core::algorithms::trusted_assertions::trusted_assertions;
+use core::algorithms::trusted_assertions_event::{self, event_assertions_event};
 use core::config::Config;
 use core::operators::probe::{Handle, ProbeNotify};
 use core::operators::top_k::TopK;
@@ -70,6 +71,8 @@ fn main() {
                 PersistQuery::default().kinds(vec![
                     Kind::ContactList.as_u16(),
                     Kind::TextNote.as_u16(),
+                    Kind::Comment.as_u16(),
+                    Kind::LongFormTextNote.as_u16(),
                     Kind::Repost.as_u16(),
                     Kind::Reaction.as_u16(),
                     Kind::Reporting.as_u16(),
@@ -132,14 +135,27 @@ fn main() {
                 )
             });
             let ta_collection = trusted_assertions(&ta_events, &follows, &ranks);
+            let ta_events_collection = event_assertions_event(&ta_events);
 
             ta_collection
                 .map(|(pubkey, assertion)| (assertion.follower_cnt, pubkey, assertion))
-                .top_k(30)
+                .top_k(5)
                 .map(|(_follower_cnt, _pubkey, assertion)| assertion)
                 .inspect(|(assertion, _t, diff)| {
                     if *diff > 0 {
                         tracing::info!("trusted assertion: {:?}", assertion);
+                    }
+                })
+                .inner
+                .probe_notify_with(vec![probe.clone()]);
+
+            ta_events_collection
+                .map(|(pubkey, assertion)| (assertion.rank, assertion))
+                .top_k(5)
+                .map(|(_rank, assertion)| assertion)
+                .inspect(|(assertion, _t, diff)| {
+                    if *diff > 0 {
+                        tracing::info!("trusted events assertion: {:?}", assertion);
                     }
                 })
                 .inner
