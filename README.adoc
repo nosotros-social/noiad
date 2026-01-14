@@ -1,3 +1,109 @@
 = Noiad
 
-A stream processor for nostr built on differential-dataflow
+A stream processor for Nostr built on https://github.com/TimelyDataflow/differential-dataflow[differential dataflow], a data-parallel framework for iterative and incremental computations.
+
+[quote]
+Noiad is being developed as a WoTathon project—a Web of Trust hackathon organized by https://nosfabrica.com/ to build and develop open-source “trust engines” for network analysis and reputation systems on Nostr.
+
+== Overview
+
+Differential Dataflow is a Rust library built on Timely Dataflow, a low-latency, cyclic dataflow model introduced in the paper https://dl.acm.org/doi/10.1145/2517349.2522738[_Naiad: A Timely Dataflow System_]. It allows efficient processing of large volumes of data and quickly responds to changes in input collections.
+
+Timely Dataflow programs can be expressed as directed cyclic graphs of stateful vertices and message-passing edges. It supports higher-level control constructs like iteration, combining the high throughput of batch processors with the low latency of stream processors and the strengths of graph processing in a single unified framework.
+
+Timely is also largely data-parallel: operators can distribute computations across multiple workers to process independent parts of the data concurrently, whether across threads or across multiple machines in a cluster.
+
+Differential Dataflow enables iterative computation for social-graph analysis on changing data. Algorithms like PageRank can be incrementally updated through repeated iterations as new data arrives.
+
+Noiad is a stream processor built on top of Timely and Differential Dataflow to compute PageRank, trusted assertions, and more. You can think of Noiad as a framework for incremental view maintenance (or https://sophiebits.com/2025/08/22/materialized-views-are-obviously-useful[materialized views]) for Nostr: computations are maintained over time as new data arrives, producing correct outputs associated with changes, from PageRank to trusted assertions, in a reactive fashion.
+
+== Architecture
+
+Noiad currently ingests data from PostgreSQL using a snapshot of a publication table containing the `id`, `pubkey`, `created_at`, `kind`, and `tags` columns. Additional external sources are expected to be supported in the future alongside PostgreSQL, such as Nostr relays.
+
+In the initial ingestion phase, Noiad performs a consistent snapshot of the table and streams its contents into a persistent key-value layer backed by RocksDB. After the snapshot, Noiad switches to logical replication to track ongoing updates and keep the system in sync. If the system was offline, on the next startup it will automatically catch up by replaying the changes, skipping the initial snapshot.
+
+Noiad internalizes all event IDs and pubkeys from the events and their tags by mapping them to compact sequential `u32` identifiers, making the key-value store significantly smaller and more memory-efficient than storing the raw source stream.
+
+NOTE: Currently, the original event cannot be reconstructed from the persisted layer.
+
+== Algorithms
+
+Noiad currently implements the following algorithms:
+
+* Global PageRank
+* NIP-85 - trusted assertions for users
+* NIP-85 - trusted assertions for events
+* k-core
+* k-top
+
+== Further Work
+
+One of the goals of Noiad is to become more on-demand and personalized, allowing computations to be derived dynamically from the dataflow for a given point of view.
+
+In no particular order:
+
+* A query layer to access Differential Dataflow arrangements directly
+* Feature extraction pipelines for embeddings
+* Personalized trending feeds
+* Custom storage for Differential Dataflow arrangements backed by memory-mapped files
+* Community-detection algorithms such as Louvain and label propagation
+
+== Get Started
+
+[quote]
+This project currently isn't ready for production or deployment.
+
+Noiad reads a snapshot of a PostgreSQL table and then keeps it in sync using logical replication.
+
+=== 1. Enable logical replication
+
+In `postgresql.conf` (or your DB parameters), set:
+
+[source,conf]
+----
+wal_level = logical
+----
+
+Restart PostgreSQL after changing it.
+
+=== 2. Create a publication
+
+Assuming your events table is already there:
+
+[source,sql]
+----
+CREATE PUBLICATION nostr_publication
+FOR TABLE events;
+----
+
+=== 3. Run Noiad
+
+Set the environment variables:
+
+[source,bash]
+----
+DB_URL="host=127.0.0.1 dbname=nostrharvest user=postgres sslmode=disable"
+DB_PUBLICATION=nostr_publication
+DB_REPLICATION_SLOT=nostr_slot # the slot will be created during replication
+
+cd core
+cargo run --release -- -w 4 # num of workers
+----
+
+On first start, Noiad will take a consistent snapshot of the table and persist it into RocksDB.
+After that, it will consume changes from the replication slot to keep itself in sync.
+On restart, the snapshot phase is skipped and it resumes directly from replication.
+
+== Further Reading
+
+* https://github.com/TimelyDataflow/timely-dataflow
+* https://github.com/TimelyDataflow/differential-dataflow
+* Timely dataflow in three easy steps! - https://www.youtube.com/watch?v=yOnPmVf4YWo
+* Naiad: a timely dataflow system - https://www.youtube.com/watch?v=yyhMI9r0A9E
+* NWDS Talk - Building modern dataflow systems - Frank McSherry - https://www.youtube.com/watch?v=v483UydXszY
+* It's About Time: An Introduction to Timely Dataflow | Clockworks - https://www.youtube.com/watch?v=ZN7nOwJTSZ0
+
+== License
+
+MIT
