@@ -664,8 +664,6 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
- "lightning",
- "lightning-invoice",
  "nostr-sdk 0.44.1",
  "persist",
  "postgres-replication",
@@ -2046,6 +2044,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hex",
+ "lightning",
+ "lightning-invoice",
+ "nostr-sdk 0.44.1",
  "rkyv",
  "rocksdb",
  "serde",
