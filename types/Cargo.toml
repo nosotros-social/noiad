@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rkyv = "0.8.14"
+nostr-sdk = "0.43.0"
 serde = { version = "1.0.228", features = ["derive"] }
+anyhow = "1.0.100"

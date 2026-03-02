@@ -199,9 +199,9 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "base64ct"
-version = "1.8.2"
+version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d809780667f4410e7c41b07f52439b94d2bdf8528eeedc287fa38d3b7f95d82"
+checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bech32"
@@ -565,9 +565,9 @@ dependencies = [
 
 [[package]]
 name = "clap_lex"
-version = "0.7.6"
+version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1d728cc89cf3aee9ff92b05e62b19ee65a02b5702cff7d5a377e32c6ae29d8d"
+checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
 
 [[package]]
 name = "colorchoice"
@@ -651,34 +651,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
-name = "core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "atoi",
- "blake3",
- "clap",
- "compact_bytes",
- "differential-dataflow",
- "dotenvy",
- "futures",
- "futures-util",
- "hex",
- "nostr-sdk 0.44.1",
- "persist",
- "postgres-replication",
- "serde",
- "serde_json",
- "timely",
- "tokio",
- "tokio-postgres",
- "tokio-stream",
- "tracing",
- "tracing-subscriber",
- "types",
-]
-
-[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -717,6 +689,15 @@ name = "crc-catalog"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
+
+[[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
 
 [[package]]
 name = "crossbeam-queue"
@@ -1670,6 +1651,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0efe882e02d206d8d279c20eb40e03baf7cb5136a1476dc084a324fbc3ec42d"
 
 [[package]]
+name = "noiad_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "atoi",
+ "blake3",
+ "clap",
+ "compact_bytes",
+ "crossbeam-channel",
+ "differential-dataflow",
+ "dotenvy",
+ "futures",
+ "futures-util",
+ "hex",
+ "nostr-sdk",
+ "persist",
+ "postgres-replication",
+ "serde",
+ "serde_json",
+ "timely",
+ "tokio",
+ "tokio-postgres",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+ "transport",
+ "types",
+]
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1703,58 +1715,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "nostr"
-version = "0.44.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aa5e3b6a278ed061835fe1ee293b71641e6bf8b401cfe4e1834bbf4ef0a34e1"
-dependencies = [
- "base64",
- "bech32",
- "bip39",
- "bitcoin_hashes",
- "cbc",
- "chacha20",
- "chacha20poly1305",
- "getrandom 0.2.17",
- "hex",
- "instant",
- "scrypt",
- "secp256k1",
- "serde",
- "serde_json",
- "unicode-normalization",
- "url",
-]
-
-[[package]]
 name = "nostr-database"
 version = "0.43.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1c75a8c2175d2785ba73cfddef21d1e30da5fbbdf158569b6808ba44973a15b"
 dependencies = [
  "lru",
- "nostr 0.43.1",
+ "nostr",
  "tokio",
-]
-
-[[package]]
-name = "nostr-database"
-version = "0.44.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7462c9d8ae5ef6a28d66a192d399ad2530f1f2130b13186296dbb11bdef5b3d1"
-dependencies = [
- "lru",
- "nostr 0.44.2",
- "tokio",
-]
-
-[[package]]
-name = "nostr-gossip"
-version = "0.44.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ade30de16869618919c6b5efc8258f47b654a98b51541eb77f85e8ec5e3c83a6"
-dependencies = [
- "nostr 0.44.2",
 ]
 
 [[package]]
@@ -1767,8 +1735,8 @@ dependencies = [
  "async-wsocket",
  "atomic-destructor",
  "negentropy",
- "nostr 0.43.1",
- "nostr-database 0.43.0",
+ "nostr",
+ "nostr-database",
  "tokio",
  "tracing",
 ]
@@ -1784,26 +1752,8 @@ dependencies = [
  "atomic-destructor",
  "lru",
  "negentropy",
- "nostr 0.43.1",
- "nostr-database 0.43.0",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "nostr-relay-pool"
-version = "0.44.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b1073ccfbaea5549fb914a9d52c68dab2aecda61535e5143dd73e95445a804b"
-dependencies = [
- "async-utility",
- "async-wsocket",
- "atomic-destructor",
- "hex",
- "lru",
- "negentropy",
- "nostr 0.44.2",
- "nostr-database 0.44.0",
+ "nostr",
+ "nostr-database",
  "tokio",
  "tracing",
 ]
@@ -1815,25 +1765,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "599f8963d6a1522a13b1a2b0ea6e168acfc367706606f1d33fa595e91fa22db0"
 dependencies = [
  "async-utility",
- "nostr 0.43.1",
- "nostr-database 0.43.0",
- "nostr-relay-pool 0.43.1",
+ "nostr",
+ "nostr-database",
+ "nostr-relay-pool",
  "tokio",
-]
-
-[[package]]
-name = "nostr-sdk"
-version = "0.44.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "471732576710e779b64f04c55e3f8b5292f865fea228436daf19694f0bf70393"
-dependencies = [
- "async-utility",
- "nostr 0.44.2",
- "nostr-database 0.44.0",
- "nostr-gossip",
- "nostr-relay-pool 0.44.0",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1841,8 +1776,8 @@ name = "nostrpg"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "nostr-database 0.43.0",
- "nostr-sdk 0.43.0",
+ "nostr-database",
+ "nostr-sdk",
  "serde",
  "sqlx",
  "sqlx-cli",
@@ -2046,7 +1981,7 @@ dependencies = [
  "hex",
  "lightning",
  "lightning-invoice",
- "nostr-sdk 0.44.1",
+ "nostr-sdk",
  "rkyv",
  "rocksdb",
  "serde",
@@ -2264,7 +2199,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6db2770f06117d490610c7488547d543617b21bfa07796d7a12f6f1bd53850d1"
 dependencies = [
  "rand_chacha 0.9.0",
- "rand_core 0.9.3",
+ "rand_core 0.9.5",
 ]
 
 [[package]]
@@ -2284,7 +2219,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
 dependencies = [
  "ppv-lite86",
- "rand_core 0.9.3",
+ "rand_core 0.9.5",
 ]
 
 [[package]]
@@ -2298,9 +2233,9 @@ dependencies = [
 
 [[package]]
 name = "rand_core"
-version = "0.9.3"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99d9a13982dcf210057a8a78572b2217b667c3beacbf3a0d8b454f6f82837d38"
+checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
 ]
@@ -2357,12 +2292,14 @@ name = "relay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nostr-database",
  "nostr-relay-builder",
- "nostr-sdk 0.43.0",
+ "nostr-sdk",
  "nostrpg",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "transport",
 ]
 
 [[package]]
@@ -2390,9 +2327,9 @@ dependencies = [
 
 [[package]]
 name = "rkyv"
-version = "0.8.13"
+version = "0.8.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b2e88acca7157d83d789836a3987dafc12bc3d88a050e54b8fe9ea4aaa29d20"
+checksum = "360b333c61ae24e5af3ae7c8660bd6b21ccd8200dbbc5d33c2454421e85b9c69"
 dependencies = [
  "bytecheck",
  "bytes",
@@ -2409,9 +2346,9 @@ dependencies = [
 
 [[package]]
 name = "rkyv_derive"
-version = "0.8.13"
+version = "0.8.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f6dffea3c91fa91a3c0fc8a061b0e27fef25c6304728038a6d6bcb1c58ba9bd"
+checksum = "7c02f8cdd12b307ab69fe0acf4cd2249c7460eb89dce64a0febadf934ebb6a9e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3374,6 +3311,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "transport"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "nostr-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "tungstenite"
 version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3402,6 +3352,9 @@ checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 name = "types"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "nostr-sdk",
+ "rkyv",
  "serde",
 ]
 
@@ -4038,9 +3991,9 @@ dependencies = [
 
 [[package]]
 name = "zmij"
-version = "1.0.13"
+version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac93432f5b761b22864c774aac244fa5c0fd877678a4c37ebf6cf42208f9c9ec"
+checksum = "bd8f3f50b848df28f887acb68e41201b5aea6bc8a8dacc00fb40635ff9a72fea"
 
 [[package]]
 name = "zstd-sys"
