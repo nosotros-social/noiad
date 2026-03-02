@@ -62,26 +62,26 @@ impl NostrDatabase for NostrPg {
         })
     }
 
-    fn count(&self, filter: Filter) -> BoxedFuture<Result<usize, DatabaseError>> {
+    fn count(&self, filter: Filter) -> BoxedFuture<'_, Result<usize, DatabaseError>> {
         Box::pin(async move { self.count(filter).await.map_err(DatabaseError::backend) })
     }
 
-    fn query(&self, filter: Filter) -> BoxedFuture<Result<Events, DatabaseError>> {
+    fn query(&self, filter: Filter) -> BoxedFuture<'_, Result<Events, DatabaseError>> {
         Box::pin(async move { self.query(filter).await.map_err(DatabaseError::backend) })
     }
 
     fn negentropy_items(
         &self,
         _filter: Filter,
-    ) -> BoxedFuture<Result<Vec<(EventId, Timestamp)>, DatabaseError>> {
+    ) -> BoxedFuture<'_, Result<Vec<(EventId, Timestamp)>, DatabaseError>> {
         Box::pin(async move { Ok(Vec::new()) })
     }
 
-    fn delete(&self, _filter: Filter) -> BoxedFuture<Result<(), DatabaseError>> {
+    fn delete(&self, _filter: Filter) -> BoxedFuture<'_, Result<(), DatabaseError>> {
         Box::pin(async move { Ok(()) })
     }
 
-    fn wipe(&self) -> BoxedFuture<Result<(), DatabaseError>> {
+    fn wipe(&self) -> BoxedFuture<'_, Result<(), DatabaseError>> {
         Box::pin(async move { Ok(()) })
     }
 }
