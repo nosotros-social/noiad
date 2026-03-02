@@ -5,12 +5,13 @@ use differential_dataflow::{
 };
 use nostr_sdk::Kind;
 use persist::event::EventRecord;
-use persist::tag::EventTag;
 use serde::{Deserialize, Serialize};
 use timely::{dataflow::Scope, order::TotalOrder};
-use types::event::Node;
-
-use crate::types::Diff;
+use types::{
+    event::EventRow,
+    tags::EventTag,
+    types::{Diff, Node},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 enum EventPart {
@@ -61,7 +62,7 @@ impl EventAssertion {
 }
 
 pub fn event_assertions_event<G>(
-    events: &VecCollection<G, EventRecord, Diff>,
+    events: &VecCollection<G, EventRow, Diff>,
 ) -> VecCollection<G, (Node, EventAssertion), Diff>
 where
     G: Scope,
@@ -203,14 +204,11 @@ where
 mod tests {
     use super::*;
     use differential_dataflow::input::InputSession;
-    use persist::tag::EventTag;
     use std::sync::mpsc::channel;
     use timely::dataflow::operators::Capture;
     use timely::dataflow::operators::capture::Extract;
     use timely::dataflow::operators::probe::Handle as ProbeHandle;
     use timely::execute_directly;
-
-    use crate::types::Diff;
 
     const PUBKEY1: u32 = 1;
     const PUBKEY2: u32 = 2;
@@ -223,12 +221,12 @@ mod tests {
 
     fn build_dataflow<FBuild>(build_inputs: FBuild) -> Vec<(Node, EventAssertion, u64, Diff)>
     where
-        FBuild: FnOnce(&mut InputSession<u64, EventRecord, Diff>) + Send + Sync + 'static,
+        FBuild: FnOnce(&mut InputSession<u64, EventRow, Diff>) + Send + Sync + 'static,
     {
         let (tx, rx) = channel();
 
         execute_directly(move |worker| {
-            let mut events_input: InputSession<u64, EventRecord, Diff> = InputSession::new();
+            let mut events_input: InputSession<u64, EventRow, Diff> = InputSession::new();
             let probe = ProbeHandle::new();
 
             worker.dataflow::<u64, _, _>(|scope| {
@@ -280,21 +278,21 @@ mod tests {
     #[test]
     fn assert_event_assertions() {
         let captured = build_dataflow(|events_input| {
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: EVENT_POST1,
                 pubkey: PUBKEY1,
                 created_at: 1000,
                 kind: Kind::TextNote.as_u16(),
                 tags: vec![],
             });
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: EVENT_POST2,
                 pubkey: PUBKEY2,
                 created_at: 1001,
                 kind: Kind::TextNote.as_u16(),
                 tags: vec![],
             });
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: EVENT_POST3,
                 pubkey: PUBKEY3,
                 created_at: 1002,
@@ -303,63 +301,63 @@ mod tests {
             });
 
             // EVENT_POST1: 3 reactions, 2 comments, 1 quote, 1 repost, 2 zaps (8000 sats)
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 200,
                 pubkey: PUBKEY2,
                 created_at: 2000,
                 kind: Kind::Reaction.as_u16(),
                 tags: vec![EventTag::Mention(EVENT_POST1)],
             });
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 201,
                 pubkey: PUBKEY3,
                 created_at: 2001,
                 kind: Kind::Reaction.as_u16(),
                 tags: vec![EventTag::Mention(EVENT_POST1)],
             });
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 202,
                 pubkey: PUBKEY1,
                 created_at: 2002,
                 kind: Kind::Reaction.as_u16(),
                 tags: vec![EventTag::Mention(EVENT_POST1)],
             });
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 203,
                 pubkey: PUBKEY2,
                 created_at: 2003,
                 kind: Kind::TextNote.as_u16(),
                 tags: vec![EventTag::Reply(EVENT_POST1)],
             });
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 204,
                 pubkey: PUBKEY3,
                 created_at: 2004,
                 kind: Kind::TextNote.as_u16(),
                 tags: vec![EventTag::RootReply(EVENT_POST1)],
             });
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 205,
                 pubkey: PUBKEY2,
                 created_at: 2005,
                 kind: Kind::TextNote.as_u16(),
                 tags: vec![EventTag::Quote(EVENT_POST1)],
             });
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 206,
                 pubkey: PUBKEY3,
                 created_at: 2006,
                 kind: Kind::Repost.as_u16(),
                 tags: vec![EventTag::Mention(EVENT_POST1)],
             });
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 207,
                 pubkey: PUBKEY_LN,
                 created_at: 2007,
                 kind: Kind::ZapReceipt.as_u16(),
                 tags: vec![EventTag::Mention(EVENT_POST1), EventTag::Bolt11(5000)],
             });
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 208,
                 pubkey: PUBKEY_LN,
                 created_at: 2008,
@@ -368,7 +366,7 @@ mod tests {
             });
 
             // EVENT_POST2: 1 reaction only
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 300,
                 pubkey: PUBKEY1,
                 created_at: 3000,
@@ -389,7 +387,6 @@ mod tests {
         assert_eq!(assertion1.rank, 31);
 
         let rows2 = get_captured_by_event(&captured, EVENT_POST2);
-        println!("Captured EVENT_POST1 rows: {:?}", rows2);
         assert_eq!(rows2.len(), 1);
         let assertion2 = &rows2[0].1;
         assert_eq!(assertion2.rank, 6);

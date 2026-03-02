@@ -1,20 +1,22 @@
 [package]
-name = "core"
+name = "noiad_core"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+async-trait = "0.1.89"
 atoi = "2.0.0"
 blake3 = "1.8.2"
-clap = { version = "4.5.48", features = ["derive"] }
+clap = { version = "4.5.48", features = ["derive", "env"] }
 compact_bytes = "0.2.1"
+crossbeam-channel = "0.5.15"
 differential-dataflow = "0.18.0"
 dotenvy = "0.15.7"
 futures = "0.3.31"
 futures-util = "0.3.31"
 hex = "0.4.3"
-nostr-sdk = "0.44.1"
+nostr-sdk = "0.43.0"
 persist = { path = "../persist" }
 postgres-replication = { git = "https://github.com/materializeinc/rust-postgres", package = "postgres-replication" }
 serde = "1.0.228"
@@ -25,7 +27,12 @@ tokio-postgres = { git = "https://github.com/materializeinc/rust-postgres" }
 tokio-stream = { version = "0.1.17", features = ["time"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"
+transport = { version = "0.1.0", path = "../transport" }
 types = { version = "0.1.0", path = "../types" }
 
 [dev-dependencies]
 tokio-stream = "0.1.17"
+
+[lints.rust]
+unused = "allow"
+dead_code = "allow"

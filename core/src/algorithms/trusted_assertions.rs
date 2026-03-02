@@ -7,12 +7,11 @@ use differential_dataflow::{
 };
 use nostr_sdk::Kind;
 use persist::event::EventRecord;
-use persist::tag::EventTag;
 use serde::{Deserialize, Serialize};
 use timely::{dataflow::Scope, order::TotalOrder};
-use types::event::{Edge, Node};
-
-use crate::types::Diff;
+use types::event::EventRow;
+use types::tags::EventTag;
+use types::types::{Diff, Edge, Node};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 enum TrustedPart {
@@ -56,7 +55,7 @@ pub struct TrustedAssertion {
     pub active_hours_end: Option<u8>,
 }
 
-const MIN_NORMALIZED_RANK: Diff = 10;
+const MIN_NORMALIZED_RANK: Diff = 8;
 
 /// Parameters for pagerank normalization curve
 /// https://gist.github.com/pippellia-btc/8642a25fcf535edcda1ddecd0bcd5f7b
@@ -83,9 +82,9 @@ pub fn normalize_pagerank(rank: Diff) -> Diff {
 }
 
 /// NIP-85 implementation
-/// https://github.com/nostr-protocol/nips/blob/1ced632b45f603aca46a4741b54beea1b090388c/85.md
+/// https://github.com/nostr-protocol/nips/blob/master/85.md
 pub fn trusted_assertions<G>(
-    events: &VecCollection<G, EventRecord, Diff>,
+    events: &VecCollection<G, EventRow, Diff>,
     edges_follows: &VecCollection<G, Edge, Diff>,
     ranks: &VecCollection<G, Node, Diff>,
 ) -> VecCollection<G, (Node, TrustedAssertion), Diff>
@@ -102,8 +101,11 @@ where
         .map(|(pk, _rank)| (pk, ()));
 
     let follower_cnt = edges_follows
-        .join_map(&followers_ranked, |_follower, &followed, &()| followed)
-        .distinct()
+        .join_map(&followers_ranked, |follower, &followed, &()| {
+            ((followed, *follower), ())
+        })
+        .threshold(|_, _| 1)
+        .map(|((followed, _follower), ())| followed)
         .count_total()
         .map(|(pk, cnt)| (pk, TrustedPart::FollowerCnt(cnt)));
 
@@ -320,7 +322,8 @@ where
         .map(|(pk, reports_cnt_sent)| (pk, TrustedPart::ReportsCntSent(reports_cnt_sent)));
 
     let reports_cnt_recd = events
-        .flat_map(|e| e.reported_pubkeys())
+        .filter(|e| e.has_report())
+        .flat_map(|e| e.p_tags())
         .count_total()
         .map(|(pk, reports_cnt_recd)| (pk, TrustedPart::ReportsCntRecd(reports_cnt_recd)));
 
@@ -462,16 +465,14 @@ where
 mod tests {
     use super::*;
     use differential_dataflow::input::InputSession;
-    use persist::edges::EdgeLabel;
-    use persist::tag::EventTag;
     use std::sync::mpsc::channel;
     use timely::dataflow::operators::Capture;
     use timely::dataflow::operators::capture::Extract;
     use timely::dataflow::operators::probe::Handle as ProbeHandle;
     use timely::execute_directly;
+    use types::edges::EdgeLabel;
 
     use crate::algorithms::pagerank::pagerank;
-    use crate::types::Diff;
 
     const PUBKEY1: Node = 1;
     const PUBKEY2: Node = 2;
@@ -485,12 +486,12 @@ mod tests {
 
     fn build_dataflow<FBuild>(build_inputs: FBuild) -> Vec<(Node, TrustedAssertion, u64, Diff)>
     where
-        FBuild: FnOnce(&mut InputSession<u64, EventRecord, Diff>) + Send + Sync + 'static,
+        FBuild: FnOnce(&mut InputSession<u64, EventRow, Diff>) + Send + Sync + 'static,
     {
         let (tx, rx) = channel();
 
         execute_directly(move |worker| {
-            let mut events_input: InputSession<u64, EventRecord, Diff> = InputSession::new();
+            let mut events_input: InputSession<u64, EventRow, Diff> = InputSession::new();
             let probe = ProbeHandle::new();
 
             worker.dataflow::<u64, _, _>(|scope| {
@@ -552,21 +553,21 @@ mod tests {
     fn assert_trusted_assertions_for_pubkey() {
         let captured = build_dataflow(|events_input| {
             // Follow events
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 30,
                 pubkey: PUBKEY1,
                 created_at: 2 * 3600,
                 kind: Kind::ContactList.as_u16(),
                 tags: vec![EventTag::Pubkey(PUBKEY2)],
             });
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 31,
                 pubkey: PUBKEY2,
                 created_at: 10 * 3600,
                 kind: Kind::ContactList.as_u16(),
                 tags: vec![EventTag::Pubkey(PUBKEY1)],
             });
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 32,
                 pubkey: PUBKEY3,
                 created_at: 7 * 3600,
@@ -575,23 +576,23 @@ mod tests {
             });
 
             // pubkey1 root posts
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 10,
                 pubkey: PUBKEY1,
                 created_at: 3600,
                 kind: Kind::TextNote.as_u16(),
-                tags: vec![EventTag::Hashtag(HASHTAG_NOSTR)],
+                tags: vec![EventTag::Topic(HASHTAG_NOSTR)],
             });
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 11,
                 pubkey: PUBKEY1,
                 created_at: 3 * 3600,
                 kind: Kind::TextNote.as_u16(),
-                tags: vec![EventTag::Hashtag(HASHTAG_WOT)],
+                tags: vec![EventTag::Topic(HASHTAG_WOT)],
             });
 
             // pubkey1 replies at hour 20
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 12,
                 pubkey: PUBKEY1,
                 created_at: 20 * 3600,
@@ -600,7 +601,7 @@ mod tests {
             });
 
             // pubkey1 reacts to note 10 from pubkey1
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 13,
                 pubkey: PUBKEY1,
                 created_at: 21 * 3600,
@@ -609,7 +610,7 @@ mod tests {
             });
 
             // pubkey1 reacts to note 11 from pubkey1
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 14,
                 pubkey: PUBKEY1,
                 created_at: 22 * 3600,
@@ -618,15 +619,15 @@ mod tests {
             });
 
             // pubkey1 reports pubkey2
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 15,
                 pubkey: PUBKEY1,
                 created_at: 23 * 3600,
                 kind: Kind::Reporting.as_u16(),
-                tags: vec![EventTag::PubkeyReport(PUBKEY2)],
+                tags: vec![EventTag::Pubkey(PUBKEY2)],
             });
 
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 16,
                 pubkey: PUBKEY2,
                 created_at: 5 * 3600,
@@ -634,7 +635,7 @@ mod tests {
                 tags: vec![EventTag::Pubkey(PUBKEY1)],
             });
 
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 17,
                 pubkey: PUBKEY3,
                 created_at: 6 * 3600,
@@ -642,7 +643,7 @@ mod tests {
                 tags: vec![EventTag::Pubkey(PUBKEY1)],
             });
 
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 18,
                 pubkey: PUBKEY3,
                 created_at: 7 * 3600,
@@ -650,7 +651,7 @@ mod tests {
                 tags: vec![],
             });
 
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 19,
                 pubkey: PUBKEY3,
                 created_at: 8 * 3600,
@@ -659,7 +660,7 @@ mod tests {
             });
 
             // pubkey1 zaps pubkey2 1000 sats
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 20,
                 pubkey: PUBKEY_LN,
                 created_at: 9 * 3600,
@@ -671,7 +672,7 @@ mod tests {
                 ],
             });
             // pubkey2 zaps pubkey1 2000 sats
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 21,
                 pubkey: PUBKEY_LN,
                 created_at: 10 * 3600,
@@ -705,7 +706,7 @@ mod tests {
             // expected_topics.sort();
 
             let expected = TrustedAssertion {
-                follower_cnt: 1,
+                follower_cnt: 2,
                 rank: Some(52),
                 first_created_at: Some(3600),
                 post_cnt: 2,
@@ -728,7 +729,7 @@ mod tests {
             // res1_sorted.topics = topics;
 
             // assert_eq!(expected_topics, res1_sorted.topics);
-            // assert_eq!(expected, res1_sorted);
+            assert_eq!(res1, expected);
         }
 
         // pubkey2
@@ -775,7 +776,7 @@ mod tests {
     #[test]
     fn assert_follow_edges_inserts_and_deletes() {
         let captured = build_dataflow(|events_input| {
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 1,
                 pubkey: PUBKEY2,
                 created_at: 2000,
@@ -783,7 +784,7 @@ mod tests {
                 tags: vec![EventTag::Pubkey(PUBKEY1)],
             });
 
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 2,
                 pubkey: PUBKEY1,
                 created_at: 2000,
@@ -791,14 +792,14 @@ mod tests {
                 tags: vec![EventTag::Pubkey(PUBKEY2)],
             });
 
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 3,
                 pubkey: PUBKEY3,
                 created_at: 2000,
                 kind: Kind::ContactList.as_u16(),
                 tags: vec![EventTag::Pubkey(PUBKEY4)],
             });
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 4,
                 pubkey: PUBKEY4,
                 created_at: 2000,
@@ -809,7 +810,7 @@ mod tests {
 
             // pubkey1 unfollows pubkey2 at timestamp 2
             events_input.advance_to(2);
-            events_input.remove(EventRecord {
+            events_input.remove(EventRow {
                 id: 2,
                 pubkey: PUBKEY1,
                 created_at: 2000,
@@ -821,7 +822,7 @@ mod tests {
             // pubkey1 follows pubkey2 again at timestamp 3
             events_input.advance_to(3);
 
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 4,
                 pubkey: PUBKEY1,
                 created_at: 4000,
@@ -869,12 +870,12 @@ mod tests {
     #[test]
     fn assert_pubkey_without_events() {
         let captured = build_dataflow(|events_input| {
-            events_input.insert(EventRecord {
+            events_input.insert(EventRow {
                 id: 42,
                 pubkey: PUBKEY1,
                 created_at: 1_000,
                 kind: Kind::Reporting.as_u16(),
-                tags: vec![EventTag::PubkeyReport(PUBKEY_NO_EVENTS)],
+                tags: vec![EventTag::Pubkey(PUBKEY_NO_EVENTS)],
             });
         });
 
@@ -891,5 +892,65 @@ mod tests {
 
         assert_eq!(*pk, PUBKEY_NO_EVENTS);
         assert_eq!(*assertion, expected);
+    }
+
+    #[test]
+    fn assert_follower_cnt() {
+        const PUBKEY_TARGET: Node = 99;
+        const PUBKEY_FOLLOWER_1: Node = 10;
+        const PUBKEY_FOLLOWER_2: Node = 11;
+        const PUBKEY_FOLLOWER_3: Node = 12;
+
+        let captured = build_dataflow(|events_input| {
+            events_input.insert(EventRow {
+                id: 1,
+                pubkey: PUBKEY_FOLLOWER_1,
+                created_at: 1000,
+                kind: Kind::ContactList.as_u16(),
+                tags: vec![
+                    EventTag::Pubkey(PUBKEY_FOLLOWER_2),
+                    EventTag::Pubkey(PUBKEY_TARGET),
+                    EventTag::Pubkey(PUBKEY_TARGET), // duplicated
+                ],
+            });
+
+            events_input.insert(EventRow {
+                id: 2,
+                pubkey: PUBKEY_FOLLOWER_2,
+                created_at: 1001,
+                kind: Kind::ContactList.as_u16(),
+                tags: vec![
+                    EventTag::Pubkey(PUBKEY_FOLLOWER_3),
+                    EventTag::Pubkey(PUBKEY_TARGET),
+                ],
+            });
+
+            events_input.insert(EventRow {
+                id: 3,
+                pubkey: PUBKEY_FOLLOWER_3,
+                created_at: 1002,
+                kind: Kind::ContactList.as_u16(),
+                tags: vec![
+                    EventTag::Pubkey(PUBKEY_FOLLOWER_1),
+                    EventTag::Pubkey(PUBKEY_TARGET),
+                ],
+            });
+
+            events_input.insert(EventRow {
+                id: 4,
+                pubkey: PUBKEY_FOLLOWER_1,
+                created_at: 1003,
+                kind: Kind::ContactList.as_u16(),
+                tags: vec![EventTag::Pubkey(PUBKEY_TARGET)],
+            });
+        });
+
+        let assertion = get_captured_by_pubkey(&captured, PUBKEY_TARGET)
+            .into_iter()
+            .next()
+            .map(|(_, a, _, _)| a)
+            .unwrap();
+
+        assert_eq!(assertion.follower_cnt, 3);
     }
 }

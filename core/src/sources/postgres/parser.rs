@@ -1,4 +1,4 @@
-use types::event::EventRaw;
+use persist::event::EventRaw;
 
 pub struct CopyParser<'a> {
     data: &'a [u8],
@@ -29,14 +29,21 @@ fn parse_copy_row(row: &[u8], delimiter: u8) -> Option<EventRaw> {
     let created_at = atoi::atoi::<u64>(cols.next()?)?;
     let kind = atoi::atoi::<u16>(cols.next()?)?;
     let tags_input = cols.next()?;
+    let content_input = cols.next()?;
+    let sig_hex = cols.next()?;
 
     let mut id = [0u8; 32];
     let mut pubkey = [0u8; 32];
+    let mut sig = [0u8; 64];
     hex::decode_to_slice(id_hex, &mut id).ok()?;
     hex::decode_to_slice(pubkey_hex, &mut pubkey).ok()?;
+    hex::decode_to_slice(sig_hex, &mut sig).ok()?;
 
     let mut tags_json = Vec::with_capacity(tags_input.len());
     escape_into(tags_input, &mut tags_json);
+
+    let mut content = Vec::with_capacity(content_input.len());
+    escape_into(content_input, &mut content);
 
     Some(EventRaw {
         id,
@@ -44,6 +51,8 @@ fn parse_copy_row(row: &[u8], delimiter: u8) -> Option<EventRaw> {
         created_at,
         kind,
         tags_json,
+        content,
+        sig,
     })
 }
 

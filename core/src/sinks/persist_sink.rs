@@ -2,18 +2,18 @@ use anyhow::Error;
 use differential_dataflow::VecCollection;
 use futures::StreamExt;
 use persist::db::PersistInputUpdate;
+use persist::event::EventRaw;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Instant;
 use timely::container::CapacityContainerBuilder;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::{Scope, Stream, StreamCore};
-use types::event::EventRaw;
+use types::types::Diff;
 
-use crate::config::Config;
+use crate::dataflow::DataflowConfig;
 use crate::operators::builder_async::AsyncOperatorBuilder;
 use crate::operators::builder_async::Event;
-use crate::types::Diff;
 
 // TODO: make this configurable
 const BATCH_SIZE: usize = 20000;
@@ -22,7 +22,7 @@ static TOTAL_WRITTEN: AtomicUsize = AtomicUsize::new(0);
 
 pub fn persist_sink<G>(
     scope: &G,
-    config: Config,
+    config: DataflowConfig,
     input: &VecCollection<G, EventRaw, Diff>,
     lsn_stream: &Stream<G, u64>,
 ) -> StreamCore<G, Vec<()>>
@@ -36,6 +36,8 @@ where
 
     let (_done_output, done_stream) = builder.new_output::<CapacityContainerBuilder<Vec<()>>>();
 
+    let worker_id = scope.index();
+
     let _ = builder.build_fallible(move |capability_sets| {
         Box::pin(async move {
             let done_caps = &mut capability_sets[0];
@@ -45,23 +47,18 @@ where
                 match event {
                     Event::Data(_time, mut data) => {
                         for (event, ts, diff) in data.drain(..) {
-                            buffer.push((event, ts, diff as i64));
+                            buffer.push((event, ts, diff));
 
                             if buffer.len() >= BATCH_SIZE {
-                                flush_buffer(&config, &mut buffer);
+                                flush_buffer(worker_id, &config, &mut buffer);
                             }
                         }
                     }
                     Event::Progress(frontier) => {
                         if !buffer.is_empty() {
-                            flush_buffer(&config, &mut buffer);
+                            flush_buffer(worker_id, &config, &mut buffer);
                         }
 
-                        if config.worker_id == 0
-                            && let Some(Event::Data(_, mut data)) = lsn_input.next_sync()
-                        {
-                            save_checkpoint(&config, data.pop().unwrap());
-                        }
                         done_caps.downgrade(frontier.iter().clone());
 
                         if frontier.is_empty() {
@@ -80,7 +77,7 @@ where
     done_stream
 }
 
-fn flush_buffer(config: &Config, buffer: &mut Vec<PersistInputUpdate>) {
+fn flush_buffer(worker_id: usize, config: &DataflowConfig, buffer: &mut Vec<PersistInputUpdate>) {
     let count = buffer.len();
     let started = Instant::now();
 
@@ -92,22 +89,9 @@ fn flush_buffer(config: &Config, buffer: &mut Vec<PersistInputUpdate>) {
     buffer.clear();
     tracing::info!(
         "[worker {}] Applied {} updates in {:?} (total: {})",
-        config.worker_id,
+        worker_id,
         count,
         started.elapsed(),
         TOTAL_WRITTEN.load(std::sync::atomic::Ordering::SeqCst),
     );
-}
-
-fn save_checkpoint(config: &Config, lsn: u64) {
-    let store = Arc::clone(&config.persist);
-    if let Err(e) = store.save_checkpoint(lsn) {
-        tracing::error!("Failed to save checkpoint: {:?}", e);
-    } else {
-        tracing::info!(
-            "[worker {}] Saved checkpoint LSN: {}",
-            config.worker_id,
-            lsn
-        );
-    }
 }

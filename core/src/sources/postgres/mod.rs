@@ -1,7 +1,7 @@
 use timely::dataflow::{Scope, StreamCore};
 
 use crate::{
-    config::Config,
+    dataflow::DataflowConfig,
     sinks::persist_sink::persist_sink,
     sources::postgres::{replication::replication, snapshot::snapshot},
 };
@@ -12,7 +12,7 @@ mod replication;
 mod snapshot;
 pub mod utils;
 
-pub fn render<G>(scope: &G, config: Config) -> StreamCore<G, Vec<()>>
+pub fn render<G>(scope: &G, config: DataflowConfig) -> StreamCore<G, Vec<()>>
 where
     G: Scope<Timestamp = u64>,
 {

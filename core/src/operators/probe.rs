@@ -114,7 +114,7 @@ impl<T: Timestamp> Handle<T> {
     /// # Examples
     ///
     /// ```
-    /// use crate::core::operators::probe::Handle;
+    /// use crate::noiad_core::operators::probe::Handle;
     ///
     /// let handle = Handle::<usize>::default();
     /// let frontier = handle.with_frontier(|frontier| frontier.to_vec());

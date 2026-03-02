@@ -1,10 +1,11 @@
 use anyhow::Result;
+use persist::event::EventRaw;
 use std::env;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_postgres::Client;
 use tokio_postgres::error::SqlState;
-use types::event::EventRaw;
+use types::types::Diff;
 
 use differential_dataflow::{AsCollection, VecCollection};
 use futures_util::StreamExt;
@@ -16,10 +17,9 @@ use postgres_replication::LogicalReplicationStream;
 use postgres_replication::protocol::{LogicalReplicationMessage, ReplicationMessage, TupleData};
 use tokio_postgres::types::PgLsn;
 
-use crate::config::Config;
+use crate::dataflow::DataflowConfig;
 use crate::operators::builder_async::{AsyncOperatorBuilder, Event};
 use crate::sources::postgres::connection::PostgresConnection;
-use crate::types::Diff;
 
 const ONE: Diff = 1;
 const MINUS_ONE: Diff = -1;
@@ -29,7 +29,7 @@ static PG_EPOCH: LazyLock<SystemTime> =
 
 pub fn replication<G>(
     scope: &G,
-    config: Config,
+    config: DataflowConfig,
     lsn_stream: &Stream<G, u64>,
 ) -> VecCollection<G, EventRaw, Diff>
 where
@@ -42,11 +42,13 @@ where
 
     let mut lsn_input = builder.new_disconnected_input(lsn_stream, Pipeline);
 
+    let worker_id = scope.index();
+
     let _ = builder.build_fallible(move |capabilities| {
         Box::pin(async move {
             let [raw_cap]: &mut [_; 1] = capabilities.try_into().unwrap();
 
-            if config.worker_id != 0 {
+            if worker_id != 0 {
                 return Ok::<(), anyhow::Error>(());
             }
 
@@ -75,7 +77,6 @@ where
 
             let resume_lsn_pg = PgLsn::from(resume_lsn_u64);
 
-
             tracing::info!(
                 "PgReplication started (slot={}, publication={} resume_lsn={})",
                 slot,
@@ -102,7 +103,6 @@ where
 
             let mut commit_lsn_u64: Option<u64> = None;
             let mut data_upper = resume_lsn_u64;
-
 
             raw_cap.downgrade([resume_lsn_u64]);
 
@@ -132,41 +132,32 @@ where
                                     LogicalReplicationMessage::Commit(_) => {
                                         if let Some(lsn) = commit_lsn_u64.take() {
                                             data_upper = lsn + 1;
+                                            raw_cap.downgrade([data_upper]);
                                         }
                                     }
                                     LogicalReplicationMessage::Insert(insert) => {
-                                        if  commit_lsn_u64.is_none() {
-                                            continue
-                                        };
+                                        let Some(tx_lsn) = commit_lsn_u64 else { continue; };
                                         let Some(event) = parse_event_raw(insert.tuple().tuple_data()) else {
                                             continue;
                                         };
 
-                                        raw_handle.give(&raw_cap[0], (event, data_upper, ONE));
+                                        raw_handle.give(&raw_cap[0], (event, tx_lsn, ONE));
                                     }
                                     LogicalReplicationMessage::Delete(delete) => {
-                                        if  commit_lsn_u64.is_none() {
-                                            continue
-                                        };
-                                        let Some(old) = delete.old_tuple() else { continue };
+                                        let Some(tx_lsn) = commit_lsn_u64 else { continue; };
+                                        let Some(old) = delete.old_tuple() else { continue; };
                                         let Some(event) = parse_event_raw(old.tuple_data()) else {
-                                            continue
+                                            continue;
                                         };
 
-                                        raw_handle.give(&raw_cap[0], (event, data_upper, MINUS_ONE));
+                                        raw_handle.give(&raw_cap[0], (event, tx_lsn, MINUS_ONE));
                                     }
                                     LogicalReplicationMessage::Update(_) => {}
                                     _ => {}
                                 }
                             }
 
-                            Ok(ReplicationMessage::PrimaryKeepAlive(keepalive)) => {
-                                let wal_end: u64 = keepalive.wal_end();
-                                if wal_end > data_upper {
-                                    data_upper = wal_end;
-                                    raw_cap.downgrade([data_upper]);
-                                }
-                            }
+                            Ok(ReplicationMessage::PrimaryKeepAlive(keepalive)) => {}
 
                             Err(err) => {
                                 tracing::error!("PgReplication error: {:?}", err);
@@ -215,6 +206,13 @@ fn parse_event_raw(tuple: &[TupleData]) -> Option<EventRaw> {
         TupleData::Null => b"[]".to_vec(),
         TupleData::UnchangedToast | TupleData::Binary(_) => return None,
     };
+    let content = match tuple.get(5)? {
+        TupleData::Text(bytes) => bytes.to_vec(),
+        TupleData::Null => Vec::new(),
+        TupleData::UnchangedToast | TupleData::Binary(_) => return None,
+    };
+    let mut sig = [0u8; 64];
+    hex::decode_to_slice(tuple_bytes(tuple.get(6)?)?, &mut sig).ok()?;
 
     Some(EventRaw {
         id,
@@ -222,6 +220,8 @@ fn parse_event_raw(tuple: &[TupleData]) -> Option<EventRaw> {
         created_at,
         kind,
         tags_json,
+        content,
+        sig,
     })
 }
 

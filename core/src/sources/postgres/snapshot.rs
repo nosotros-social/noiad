@@ -4,21 +4,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Error, Result, anyhow};
 use differential_dataflow::{AsCollection, VecCollection};
 use futures::TryStreamExt;
+use persist::event::EventRaw;
 use timely::dataflow::Stream;
 use timely::dataflow::channels::pact::Exchange;
 use timely::dataflow::operators::Operator;
 use timely::{container::CapacityContainerBuilder, dataflow::Scope};
 use tokio_postgres::SimpleQueryMessage;
 use tokio_postgres::types::PgLsn;
-use types::event::EventRaw;
 
-use crate::config::Config;
+use crate::dataflow::DataflowConfig;
 use crate::operators::builder_async::AsyncOperatorBuilder;
 use crate::sources::postgres::connection::PostgresConnection;
 use crate::sources::postgres::parser::{CopyParser, quote_ident};
 use crate::sources::postgres::utils::get_publication_info;
 
-pub fn snapshot<G>(scope: &G, config: Config) -> (VecCollection<G, EventRaw>, Stream<G, u64>)
+pub fn snapshot<G>(
+    scope: &G,
+    config: DataflowConfig,
+) -> (VecCollection<G, EventRaw>, Stream<G, u64>)
 where
     G: Scope<Timestamp = u64>,
 {
@@ -27,16 +30,18 @@ where
     let (raw_handle, raw_stream) = builder.new_output::<CapacityContainerBuilder<Vec<Vec<u8>>>>();
     let (lsn_handle, lsn_stream) = builder.new_output::<CapacityContainerBuilder<Vec<u64>>>();
 
+    let worker_id = scope.index();
+
     let _ = builder.build_fallible(move |capabilities| {
         Box::pin(async move {
             let [raw_cap, lsn_cap]: &mut [_; 2] = capabilities.try_into().unwrap();
 
-            let is_snapshot_leader = config.worker_id == 0;
+            let is_snapshot_leader = worker_id == 0;
             if is_snapshot_leader {
                 if let Some(checkpoint) = config.persist.load_checkpoint()? {
                     tracing::info!(
                         "[Worker {}] POSTGRES Snapshot skipped, loaded checkpoint at LSN {}",
-                        config.worker_id,
+                        worker_id.clone(),
                         checkpoint
                     );
                     lsn_handle.give(&lsn_cap[0], checkpoint);
@@ -57,7 +62,7 @@ where
 
                 let replication_client =
                     PostgresConnection::from_env().connect_replication().await?;
-                let snapshot_lsn = export_snapshot(&replication_client, config.worker_id).await?;
+                let snapshot_lsn = export_snapshot(&replication_client, worker_id).await?;
                 lsn_handle.give(&lsn_cap[0], snapshot_lsn);
 
                 for table in tables {
@@ -65,7 +70,7 @@ where
                     let table_name = quote_ident(&table.name);
                     let query = format!(
                         "COPY (
-                            SELECT id, pubkey, created_at, kind, tags 
+                            SELECT id, pubkey, created_at, kind, tags, content, sig
                             FROM {namespace}.{table_name}
                         )
                         TO STDOUT (FORMAT TEXT, DELIMITER '\t')"

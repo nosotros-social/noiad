@@ -7,8 +7,9 @@ use timely::{
     dataflow::{Scope, operators::core::Filter},
     order::Product,
 };
+use types::types::Diff;
 
-use crate::types::Diff;
+use crate::types::Rank;
 
 type Iter = usize;
 
@@ -16,7 +17,7 @@ type Iter = usize;
 pub fn pagerank<G, D>(
     iters: Iter,
     edges: &VecCollection<G, (D, D), Diff>,
-) -> VecCollection<G, D, Diff>
+) -> VecCollection<G, D, Rank>
 where
     G: Scope<Timestamp: Lattice>,
     D: ExchangeData + Hashable,

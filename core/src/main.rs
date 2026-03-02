@@ -1,32 +1,93 @@
 use clap::Parser;
-use core::algorithms::pagerank::pagerank;
-use core::algorithms::trusted_assertions::trusted_assertions;
-use core::algorithms::trusted_assertions_event::event_assertions_event;
-use core::config::Config;
-use core::operators::probe::{Handle, ProbeNotify};
-use core::operators::top_k::TopK;
-use core::sources::postgres::render;
-use core::{cli::Cli, sources::persist::persist_source::persist_source};
 use differential_dataflow::operators::CountTotal;
+use differential_dataflow::operators::arrange::ArrangeByKey;
+use noiad_core::algorithms::pagerank::pagerank;
+use noiad_core::dataflow::{DataflowConfig, TimelyConfig, build_dataflow};
+use noiad_core::operators::probe::{Handle, ProbeNotify};
+use noiad_core::operators::top_k::TopK;
+use noiad_core::server::Handler;
+use noiad_core::sources::postgres::render;
+use noiad_core::state::State;
+use noiad_core::worker::Worker;
+use noiad_core::{cli::Cli, sources::persist::persist_source::persist_source};
 use nostr_sdk::Kind;
 use persist::db::PersistStore;
-use persist::edges::EdgeLabel;
 use persist::query::PersistQuery;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::thread;
 use timely::dataflow::operators::Exchange;
 use timely::{
     container::CapacityContainerBuilder,
     dataflow::{channels::pact::Pipeline, operators::Operator},
 };
-use types::event::Node;
+use types::edges::EdgeLabel;
+use types::types::Node;
 
 use dotenvy::dotenv;
 
+async fn run(cli: Cli) {
+    let persist =
+        Arc::new(PersistStore::open(&cli.persist_path).expect("Failed to open PersistStore"));
+    let timely = TimelyConfig {
+        workers: cli.workers,
+    };
+    let config = DataflowConfig {
+        timely,
+        persist: persist.clone(),
+        pagerank_iterations: cli.pagerank_iterations,
+        pagerank_sink_batch_size: cli.pagerank_sink_batch_size,
+        replication_max_pending: cli.replication_max_pending,
+        trusted_assertions_nsec: cli.trusted_assertions_nsec.clone(),
+        trusted_lists_ranks_k: cli.trusted_lists_ranks_k,
+    };
+
+    let runtime = tokio::runtime::Handle::current();
+    let runtime_handle = runtime.clone();
+
+    let persist_timely = persist.clone();
+    let (req_txs, req_rxs, res_txs, res_rxs) = Handler::build_worker_channels(cli.workers);
+
+    let worker_guards = timely::execute(
+        timely::Config::process(config.timely.workers),
+        move |timely_worker| {
+            let _enter = runtime_handle.enter();
+            let worker_id = timely_worker.index();
+            let req_rx = req_rxs[worker_id].clone();
+            let res_tx = res_txs[worker_id].clone();
+            let mut state = State::new(persist_timely.clone());
+            let mut worker = Worker {
+                worker_id,
+                timely_worker,
+                state,
+                req_rx,
+                res_tx,
+            };
+            build_dataflow(&mut worker, config.clone());
+            worker.run();
+        },
+    );
+
+    tracing::info!("[Main] Timely workers started");
+
+    let persist_server = persist.clone();
+    let server_handler = move || Handler::new(Arc::clone(&req_txs), Arc::clone(&res_rxs));
+
+    transport::server::run_server(cli.server_addr, server_handler)
+        .await
+        .expect("Server failed");
+}
+
 fn main() {
-    tracing_subscriber::fmt().init();
+    tracing_subscriber::fmt()
+        .with_target(true)
+        .with_file(false)
+        .with_line_number(false)
+        .init();
+
     dotenv().ok();
 
-    let start = std::time::Instant::now();
     let cli = Cli::parse();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(cli.workers)
@@ -34,154 +95,5 @@ fn main() {
         .build()
         .unwrap();
 
-    let runtime_handle = runtime.handle().clone();
-
-    let rocksdb_config = persist::db::RocksDBConfig {
-        max_total_wal_size: cli.max_total_wal_size,
-    };
-    let persist = Arc::new(
-        PersistStore::open(&cli.persist_path, rocksdb_config).expect("Failed to open PersistStore"),
-    );
-
-    let _ = timely::execute(timely::Config::process(cli.workers), move |worker| {
-        let _enter = runtime_handle.enter();
-
-        let index = worker.index();
-        let persist = persist.clone();
-
-        tracing::info!("Worker {index} started");
-
-        worker.dataflow::<u64, _, _>(|scope| {
-            let config = Config {
-                worker_id: scope.index(),
-                worker_count: scope.peers(),
-                persist: Arc::clone(&persist),
-                pagerank_iterations: cli.pagerank_iterations,
-                pagerank_sink_batch_size: cli.pagerank_sink_batch_size,
-                replication_max_pending: cli.replication_max_pending,
-            };
-
-            let probe = Handle::default();
-
-            let persisted_done = render(scope, config.clone());
-
-            let events = persist_source(
-                scope,
-                config.clone(),
-                PersistQuery::default().kinds(vec![
-                    Kind::ContactList.as_u16(),
-                    Kind::TextNote.as_u16(),
-                    Kind::Comment.as_u16(),
-                    Kind::LongFormTextNote.as_u16(),
-                    Kind::Repost.as_u16(),
-                    Kind::Reaction.as_u16(),
-                    Kind::Reporting.as_u16(),
-                    Kind::ZapReceipt.as_u16(),
-                ]),
-                &persisted_done,
-                &probe,
-            );
-
-            let edges = events.flat_map(|e| e.to_edges());
-
-            let follows = edges
-                .filter(|(kind, _, _, label)| {
-                    *kind == Kind::ContactList.as_u16() && *label == EdgeLabel::Pubkey
-                })
-                .map(|(_, src, dst, _)| (src, dst));
-
-            let ranks = pagerank(cli.pagerank_iterations, &follows).consolidate();
-
-            ranks
-                .inner
-                .exchange(|_| 0)
-                .unary_frontier::<CapacityContainerBuilder<Vec<(Node, u64, isize)>>, _, _, _>(
-                    Pipeline,
-                    "PageRankLog",
-                    |_cap, _info| {
-                        let mut per_ts_counts: std::collections::BTreeMap<u64, usize> =
-                            std::collections::BTreeMap::new();
-
-                        move |(input, frontier), output| {
-                            input.for_each(|cap, data| {
-                                let ts = *cap.time();
-                                *per_ts_counts.entry(ts).or_insert(0) += data.len();
-
-                                let mut session = output.session(&cap);
-                                session.give_iterator(data.drain(..));
-                            });
-
-                            while let Some((&ts, &count)) = per_ts_counts.iter().next() {
-                                if frontier.less_equal(&ts) {
-                                    break;
-                                }
-                                per_ts_counts.remove(&ts);
-                                tracing::info!(
-                                    "[Worker {}] pagerank finished @ {}: nodes={}",
-                                    config.worker_id,
-                                    ts,
-                                    count
-                                );
-                            }
-                        }
-                    },
-                )
-                .probe_notify_with(vec![probe.clone()]);
-
-            let ta_events = events.filter(|e| {
-                !matches!(
-                    nostr_sdk::Kind::from_u16(e.kind),
-                    nostr_sdk::Kind::ContactList
-                )
-            });
-            let ta_collection = trusted_assertions(&ta_events, &follows, &ranks);
-            let ta_events_collection = event_assertions_event(&ta_events);
-
-            ta_collection
-                .map(|(pubkey, assertion)| (assertion.follower_cnt, pubkey, assertion))
-                .top_k(5)
-                .map(|(_follower_cnt, _pubkey, assertion)| assertion)
-                .inspect(|(assertion, _t, diff)| {
-                    if *diff > 0 {
-                        tracing::info!("trusted assertion: {:?}", assertion);
-                    }
-                })
-                .inner
-                .probe_notify_with(vec![probe.clone()]);
-
-            ta_events_collection
-                .map(|(_pubkey, assertion)| (assertion.rank, assertion))
-                .top_k(5)
-                .map(|(_rank, assertion)| assertion)
-                .inspect(|(assertion, _t, diff)| {
-                    if *diff > 0 {
-                        tracing::info!("trusted events assertion: {:?}", assertion);
-                    }
-                })
-                .inner
-                .probe_notify_with(vec![probe.clone()]);
-
-            edges
-                .map(|_| ())
-                .count_total()
-                .inspect(move |(((), total), _t, diff)| {
-                    if *diff > 0 {
-                        tracing::info!("[Worker {}] total edges: {}", config.worker_id, total);
-                    }
-                });
-
-            events
-                .map(|_| ())
-                .count_total()
-                .inspect(move |(((), total), _t, diff)| {
-                    if *diff > 0 {
-                        tracing::info!("[Worker {}] total events: {}", config.worker_id, total);
-                    }
-                });
-        });
-
-        while worker.step_or_park(None) {}
-    });
-
-    tracing::info!("Completed in {:?}", start.elapsed());
+    runtime.block_on(run(cli));
 }

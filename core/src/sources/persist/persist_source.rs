@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::Error;
 use differential_dataflow::{AsCollection, Data, VecCollection};
 use futures::StreamExt;
@@ -7,20 +9,22 @@ use timely::Container;
 use timely::container::CapacityContainerBuilder;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::{Scope, StreamCore};
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+use tokio::time::interval;
+use types::event::EventRow;
+use types::types::Diff;
 
-use crate::config::Config;
+use crate::dataflow::DataflowConfig;
 use crate::operators::builder_async::{AsyncOperatorBuilder, Event};
 use crate::operators::probe::Handle;
-use crate::types::Diff;
 
 pub fn persist_source<G, D, Q>(
     scope: &G,
-    config: Config,
+    config: DataflowConfig,
     query: Q,
     start_stream: &StreamCore<G, D>,
     probe: &Handle<u64>,
-) -> VecCollection<G, EventRecord, Diff>
+) -> VecCollection<G, EventRow, Diff>
 where
     G: Scope<Timestamp = u64>,
     D: Container + Data,
@@ -31,13 +35,14 @@ where
     let mut signal_input = builder.new_disconnected_input(start_stream, Pipeline);
 
     let (event_handle, event_stream) =
-        builder.new_output::<CapacityContainerBuilder<Vec<(EventRecord, u64, Diff)>>>();
+        builder.new_output::<CapacityContainerBuilder<Vec<(EventRow, u64, Diff)>>>();
 
     let probe = probe.clone();
+    let worker_id = scope.index();
 
     let _ = builder.build_fallible(move |capabilities| {
         Box::pin(async move {
-            if config.worker_id != 0 {
+            if worker_id != 0 {
                 return Ok(());
             }
             let [event_cap]: &mut [_; 1] = capabilities.try_into().unwrap();
@@ -54,14 +59,16 @@ where
             let started_at = std::time::Instant::now();
             for event in query.clone().iter(&config.persist) {
                 counter += 1;
-                event_handle.give(&event_cap[0], (event, 0, 1));
+                let ts = 0;
+                let diff = 1;
+                event_handle.give(&event_cap[0], (event, ts, diff));
                 if counter.is_multiple_of(5000) {
                     tokio::task::yield_now().await;
                 }
             }
             tracing::info!(
                 "[Worker {}] persisted source emitted {} events in {:?}",
-                config.worker_id,
+                worker_id,
                 counter,
                 started_at.elapsed()
             );
@@ -69,27 +76,34 @@ where
             event_cap.downgrade([1]);
 
             let mut subscription = config.persist.subscribe();
-            let mut max_ts = 0u64;
+            let mut next_ts = 1u64;
 
             loop {
                 match subscription.recv().await {
                     Ok((event, ts, diff)) => {
+                        let event = EventRow {
+                            id: event.id,
+                            pubkey: event.pubkey,
+                            kind: event.kind,
+                            created_at: event.created_at,
+                            tags: event.tags,
+                        };
                         if !query.matches(&event) {
                             continue;
                         }
 
-                        max_ts = max_ts.max(ts);
-                        event_handle.give(&event_cap[0], (event, ts, diff as Diff));
+                        next_ts = next_ts.max(ts);
+                        event_handle.give(&event_cap[0], (event, next_ts, diff as Diff));
 
                         if subscription.is_empty() {
                             tracing::info!(
                                 "[Worker {}] persist_source advancing frontier to {}",
-                                config.worker_id,
-                                max_ts + 1
+                                worker_id,
+                                next_ts + 1
                             );
-                            event_cap.downgrade([max_ts + 1]);
+                            event_cap.downgrade([next_ts]);
 
-                            while probe.with_frontier(|f| f.less_equal(&max_ts)) {
+                            while probe.with_frontier(|f| f.less_equal(&(next_ts - 1))) {
                                 probe.progressed().await;
                             }
                         }

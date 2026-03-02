@@ -6,8 +6,7 @@ use differential_dataflow::{
     operators::{Count, Iterate, Join, Threshold},
 };
 use timely::dataflow::Scope;
-
-use crate::types::Diff;
+use types::types::Diff;
 
 type K = isize;
 
