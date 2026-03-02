@@ -1,14 +1,12 @@
-use rkyv::{access, from_bytes, rancor};
+use rkyv::{access, deserialize, rancor};
 use rocksdb::{DBIteratorWithThreadMode, DBWithThreadMode, MultiThreaded};
-use types::event::{Kind, Node};
+use types::{event::EventRow, tags::EventTag};
 
 use crate::{
     db::PersistStore,
-    edges::EdgeLabel,
-    event::{ArchivedEventRecord, EventRecord},
+    event::ArchivedEventRecord,
     query::PersistQuery,
     schema::{EVENTS_CF, cf},
-    tag::EventTag,
 };
 
 pub struct EventIterator<'a> {
@@ -16,10 +14,8 @@ pub struct EventIterator<'a> {
     query: PersistQuery,
 }
 
-pub type KindEdgeLabel = (Kind, Node, Node, EdgeLabel);
-
 impl<'a> Iterator for EventIterator<'a> {
-    type Item = EventRecord;
+    type Item = EventRow;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -45,62 +41,37 @@ impl<'a> Iterator for EventIterator<'a> {
                 continue;
             }
 
-            let decoded = match from_bytes::<EventRecord, rancor::Error>(&value_bytes) {
-                Ok(v) => v,
-                Err(err) => {
-                    eprintln!("rocksdb iter err: {err}");
-                    continue;
-                }
+            let tags: Vec<EventTag> =
+                match deserialize::<Vec<EventTag>, rancor::Error>(&archived.tags) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        eprintln!("rkyv tags deserialize err: {err}");
+                        continue;
+                    }
+                };
+
+            let event = EventRow {
+                id: archived.id.to_native(),
+                pubkey: archived.pubkey.to_native(),
+                kind,
+                created_at: archived.created_at.to_native(),
+                tags,
             };
 
-            return Some(decoded);
-        }
-    }
-}
-
-pub struct EventEdges {
-    pub kind: Kind,
-    pub from: Node,
-    pub tags: std::vec::IntoIter<EventTag>,
-}
-
-impl Iterator for EventEdges {
-    type Item = (Kind, Node, Node, EdgeLabel);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let tag = self.tags.next()?;
-
-            let (to, label) = match tag {
-                EventTag::RootReply(target) => (target, EdgeLabel::RootReply),
-                EventTag::Reply(target) => (target, EdgeLabel::Reply),
-                EventTag::Mention(target) => (target, EdgeLabel::Mention),
-                EventTag::Pubkey(target) => (target, EdgeLabel::Pubkey),
-                EventTag::PubkeyUpper(target) => (target, EdgeLabel::PubkeyUpper),
-                EventTag::Quote(target) => (target, EdgeLabel::Quote),
-                EventTag::QuoteAddress { pubkey, .. } => (pubkey, EdgeLabel::QuoteAddress),
-                EventTag::Address { pubkey, .. } => (pubkey, EdgeLabel::Address),
-                EventTag::EventReport(target) => (target, EdgeLabel::EventReport),
-                EventTag::PubkeyReport(target) => (target, EdgeLabel::PubkeyReport),
-                EventTag::Hashtag(target) => (target, EdgeLabel::Hashtag),
-                EventTag::Bolt11(_) => continue,
-                EventTag::DTag(_) => continue,
-            };
-
-            return Some((self.kind, self.from, to, label));
+            return Some(event);
         }
     }
 }
 
 pub trait PersistQueryIter {
-    type Iter<'a>: Iterator<Item = EventRecord> + 'a
+    type Iter<'a>: Iterator<Item = EventRow> + 'a
     where
         Self: 'a;
 
     /// An iterator over rocksdb items matching the query
     fn iter<'a>(self, persist: &'a PersistStore) -> Self::Iter<'a>;
 
-    fn matches(&self, notification: &EventRecord) -> bool;
+    fn matches(&self, notification: &EventRow) -> bool;
 }
 
 impl PersistQueryIter for PersistQuery {
@@ -110,7 +81,7 @@ impl PersistQueryIter for PersistQuery {
         persist.iter_events(self)
     }
 
-    fn matches(&self, event: &EventRecord) -> bool {
+    fn matches(&self, event: &EventRow) -> bool {
         self.matches_kind(event.kind)
     }
 }
@@ -127,27 +98,84 @@ impl PersistStore {
 
 #[cfg(test)]
 mod tests {
-    use types::event::EventRaw;
+    use types::event_row;
 
-    use crate::{helpers::TestStore, query::PersistQuery};
+    use super::*;
+    use crate::{event_raw, helpers::TestStore};
 
     #[test]
-    fn assert_iter_events() {
-        let store = TestStore::new();
+    fn assert_iter_empty_store() {
+        let store = TestStore::default();
+        let events: Vec<_> = PersistQuery::default().iter(&store).collect();
+        assert!(events.is_empty());
+    }
 
-        let pubkey = [1u8; 32];
-        for i in 0..3u8 {
-            let event = EventRaw {
-                id: [i + 10; 32],
-                pubkey,
-                kind: 1,
-                created_at: 1000 + i as u64,
-                tags_json: b"[]".to_vec(),
-            };
-            store.insert_event(&event).unwrap();
-        }
+    #[test]
+    fn assert_iter_all_events() {
+        let store = TestStore::default();
 
-        let events: Vec<_> = store.iter_events(PersistQuery::default()).collect();
-        assert_eq!(events.len(), 3);
+        let e1 = store
+            .insert_event(&event_raw!(id: [1u8; 32], kind: 1))
+            .unwrap()
+            .unwrap();
+        let e2 = store
+            .insert_event(&event_raw!(id: [2u8; 32], kind: 2))
+            .unwrap()
+            .unwrap();
+        let e3 = store
+            .insert_event(&event_raw!(id: [3u8; 32], kind: 3))
+            .unwrap()
+            .unwrap();
+
+        let events: Vec<_> = PersistQuery::default().iter(&store).collect();
+        let ids: Vec<_> = events.iter().map(|e| e.id).collect();
+
+        assert_eq!(ids, vec![e1.id, e2.id, e3.id]);
+    }
+
+    #[test]
+    fn assert_iter_filter_by_multiple_kinds() {
+        let store = TestStore::default();
+
+        store
+            .insert_event(&event_raw!(id: [3u8; 32], kind: 30382))
+            .unwrap();
+        let e1 = store
+            .insert_event(&event_raw!(id: [1u8; 32], kind: 1))
+            .unwrap()
+            .unwrap();
+        let e2 = store
+            .insert_event(&event_raw!(id: [2u8; 32], kind: 3))
+            .unwrap()
+            .unwrap();
+
+        let events: Vec<_> = PersistQuery::default()
+            .kinds(vec![1, 3])
+            .iter(&store)
+            .collect();
+        let ids: Vec<_> = events.iter().map(|e| e.id).collect();
+
+        assert_eq!(ids, vec![e1.id, e2.id]);
+    }
+
+    #[test]
+    fn assert_query_matches_event_row() {
+        let query = PersistQuery::default().kinds(vec![1, 3]);
+
+        let matching = event_row! {
+            id: 1,
+            pubkey: 2,
+            kind: 1,
+            created_at: 1000,
+        };
+        let not_matching = event_row! {
+            id: 3,
+            pubkey: 4,
+            kind: 30382,
+            created_at: 2000,
+        };
+
+        assert!(query.matches(&matching));
+        assert!(!query.matches(&not_matching));
     }
 }

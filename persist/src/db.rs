@@ -2,20 +2,18 @@ use anyhow::Result;
 use rocksdb::{ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options};
 use std::path::Path;
 use tokio::sync::broadcast;
-use types::event::EventRaw;
+use types::types::Diff;
 
 use crate::{
-    event::EventRecord,
+    event::{EventRaw, EventRecord},
     interner::Interner,
-    schema::{self},
+    schema::{self, CHECKPOINTS_CF, cf},
 };
 
-pub struct RocksDBConfig {
-    pub max_total_wal_size: u64,
-}
+pub type PersistInputUpdate = (EventRaw, u64, Diff);
+pub type PersistUpdate = (EventRecord, u64, Diff);
 
-pub type PersistInputUpdate = (EventRaw, u64, i64);
-pub type PersistUpdate = (EventRecord, u64, i64);
+const CHECKPOINT_KEY: &[u8] = b"checkpoint";
 
 #[derive(Debug)]
 pub struct PersistStore {
@@ -25,12 +23,13 @@ pub struct PersistStore {
 }
 
 impl PersistStore {
-    pub fn open(path: impl AsRef<Path>, config: RocksDBConfig) -> Result<Self> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
         options.set_write_buffer_size(256 * 1024 * 1024);
-        options.set_max_total_wal_size(config.max_total_wal_size);
+        options.set_max_total_wal_size(1024 * 1024 * 1024);
+        options.set_compression_type(rocksdb::DBCompressionType::Zstd);
 
         let cfs: Vec<_> = schema::COLUMN_FAMILIES
             .iter()
@@ -49,20 +48,15 @@ impl PersistStore {
     }
 
     pub fn save_checkpoint(&self, checkpoint: u64) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle(schema::CHECKPOINTS_CF)
-            .expect("checkpoint cf must exist");
-        self.db.put_cf(&cf, b"latest", checkpoint.to_be_bytes())?;
+        let cf = cf!(self.db, CHECKPOINTS_CF);
+        self.db
+            .put_cf(&cf, CHECKPOINT_KEY, checkpoint.to_be_bytes())?;
         Ok(())
     }
 
     pub fn load_checkpoint(&self) -> Result<Option<u64>> {
-        let cf = self
-            .db
-            .cf_handle(schema::CHECKPOINTS_CF)
-            .expect("checkpoint cf must exist");
-        if let Some(value) = self.db.get_pinned_cf(&cf, b"latest")? {
+        let cf = cf!(self.db, CHECKPOINTS_CF);
+        if let Some(value) = self.db.get_pinned_cf(&cf, CHECKPOINT_KEY)? {
             let bytes: [u8; 8] = value
                 .as_ref()
                 .try_into()
@@ -77,7 +71,7 @@ impl PersistStore {
         self.updates_tx.subscribe()
     }
 
-    pub fn notify(&self, event: EventRecord, ts: u64, diff: i64) {
+    pub fn notify(&self, event: EventRecord, ts: u64, diff: Diff) {
         let _ = self.updates_tx.send((event, ts, diff));
     }
 }
@@ -89,7 +83,7 @@ mod tests {
 
     #[test]
     fn assert_store_column_families() {
-        let store = TestStore::new();
+        let store = TestStore::default();
 
         assert!(store.db.cf_handle(schema::INTERN_FORWARD_CF).is_some());
         assert!(store.db.cf_handle(schema::INTERN_REVERSE_CF).is_some());

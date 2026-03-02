@@ -1,16 +1,26 @@
 use anyhow::Result;
 use lightning_invoice::Bolt11Invoice;
-use nostr_sdk::Kind;
+use nostr_sdk::JsonUtil;
 use rkyv::{Archive, from_bytes, to_bytes};
 use rkyv::{Deserialize, Serialize, rancor};
+use serde_json::Value;
 use std::str::FromStr;
-use types::event::{EventRaw, EventRow, Node};
+use types::tags::EventTag;
 
 use crate::db::{PersistInputUpdate, PersistStore, PersistUpdate};
 use crate::interner::InternBatch;
-use crate::iter::EventEdges;
 use crate::schema::{ADDRESSABLE_CF, EVENTS_CF, REPLACEABLE_CF, cf};
-use crate::tag::EventTag;
+
+#[derive(Debug, Clone)]
+pub struct EventRaw {
+    pub id: [u8; 32],
+    pub pubkey: [u8; 32],
+    pub created_at: u64,
+    pub content: Vec<u8>,
+    pub sig: [u8; 64],
+    pub kind: u16,
+    pub tags_json: Vec<u8>,
+}
 
 #[derive(Archive, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Ord, PartialOrd)]
 pub struct EventRecord {
@@ -18,18 +28,10 @@ pub struct EventRecord {
     pub pubkey: u32,
     pub kind: u16,
     pub created_at: u64,
+    pub content: Vec<u8>,
+    pub sig: [u8; 64],
+    pub raw_tags: Vec<u8>,
     pub tags: Vec<EventTag>,
-}
-
-impl From<&EventRecord> for EventRow {
-    fn from(row: &EventRecord) -> Self {
-        EventRow {
-            id: row.id,
-            pubkey: row.pubkey,
-            kind: row.kind,
-            created_at: row.created_at,
-        }
-    }
 }
 
 impl EventRecord {
@@ -68,60 +70,33 @@ impl EventRecord {
         })
     }
 
-    #[inline]
-    pub fn to_edges(self) -> EventEdges {
-        EventEdges {
-            kind: self.kind,
-            from: self.pubkey,
-            tags: self.tags.into_iter(),
-        }
-    }
+    pub fn to_original(
+        &self,
+        id_bytes: [u8; 32],
+        pubkey_bytes: [u8; 32],
+    ) -> Result<nostr_sdk::event::Event> {
+        let content = String::from_utf8(self.content.clone())
+            .map_err(|e| anyhow::anyhow!("event content is not valid utf-8: {e}"))?;
 
-    #[inline]
-    pub fn is_note(&self) -> bool {
-        self.kind == Kind::TextNote.as_u16()
-    }
+        let tags_value: Value = match serde_json::from_slice(&self.raw_tags) {
+            Ok(Value::Array(arr)) => Value::Array(arr),
+            _ => Value::Array(vec![]),
+        };
 
-    #[inline]
-    pub fn is_reply(&self) -> bool {
-        if self.kind == Kind::Comment.as_u16() {
-            return true;
-        }
-        self.tags
-            .iter()
-            .any(|tag| matches!(tag, EventTag::Reply(_) | EventTag::RootReply(_)))
-    }
+        let json_value = serde_json::json!({
+            "id": hex::encode(id_bytes),
+            "pubkey": hex::encode(pubkey_bytes),
+            "created_at": self.created_at,
+            "kind": self.kind,
+            "tags": tags_value,
+            "content": Value::String(content),
+            "sig": hex::encode(self.sig),
+        });
 
-    pub fn is_root_post(&self) -> bool {
-        self.is_note() && !self.is_reply()
-    }
+        let json = serde_json::to_string(&json_value)?;
+        let event = nostr_sdk::event::Event::from_json(json)?;
 
-    pub fn has_report(&self) -> bool {
-        self.tags
-            .iter()
-            .any(|tag| matches!(tag, EventTag::EventReport(_) | EventTag::PubkeyReport(_)))
-    }
-
-    pub fn hashtags_for_author(self) -> impl Iterator<Item = (Node, Node)> {
-        let author = self.pubkey;
-
-        self.tags.into_iter().filter_map(move |tag| {
-            let EventTag::Hashtag(topic) = tag else {
-                return None;
-            };
-
-            Some((author, topic))
-        })
-    }
-
-    pub fn reported_pubkeys(self) -> impl Iterator<Item = Node> {
-        self.tags.into_iter().filter_map(|tag| {
-            let EventTag::PubkeyReport(pk) = tag else {
-                return None;
-            };
-
-            Some(pk)
-        })
+        Ok(event)
     }
 }
 
@@ -140,22 +115,27 @@ impl PersistStore {
         let mut batch = InternBatch::new(&self.db);
         let result = self.insert_event_internal(&mut batch, raw)?;
         self.db.write(batch.write_batch)?;
-        Ok(result)
+        Ok(result.map(|(event, _)| event))
     }
 
     fn insert_event_internal(
         &self,
         batch: &mut InternBatch,
         raw: &EventRaw,
-    ) -> Result<Option<EventRecord>> {
+    ) -> Result<Option<(EventRecord, Option<EventRecord>)>> {
         let cf_events = cf!(self.db, EVENTS_CF);
+
+        if let Some(existing_id) = self.interner.get(&self.db, &raw.id)?
+            && self
+                .db
+                .get_cf(&cf_events, existing_id.to_be_bytes())?
+                .is_some()
+        {
+            return Ok(None);
+        }
 
         let id = self.interner.intern_batch(batch, &raw.id)?;
         let pubkey = self.interner.intern_batch(batch, &raw.pubkey)?;
-
-        if self.db.get_cf(&cf_events, id.to_be_bytes())?.is_some() {
-            return Ok(None);
-        }
 
         let parsed_tags: Vec<Vec<&str>> =
             serde_json::from_slice(&raw.tags_json).unwrap_or_default();
@@ -166,8 +146,13 @@ impl PersistStore {
             pubkey,
             kind: raw.kind,
             created_at: raw.created_at,
+            content: raw.content.clone(),
+            sig: raw.sig,
+            raw_tags: raw.tags_json.clone(),
             tags,
         };
+
+        let mut deleted_event: Option<EventRecord> = None;
 
         if event.is_replaceable() {
             if let Some(old_event) = self.find_replaceable(&event)? {
@@ -175,6 +160,7 @@ impl PersistStore {
                     return Ok(None);
                 }
                 self.delete_event(batch, &old_event);
+                deleted_event = Some(old_event);
             }
             let cf_replaceable = cf!(self.db, REPLACEABLE_CF);
             batch.write_batch.put_cf(
@@ -190,6 +176,7 @@ impl PersistStore {
                     return Ok(None);
                 }
                 self.delete_event(batch, &old_event);
+                deleted_event = Some(old_event);
             }
             if let Some(key) = event.addressable_key() {
                 let cf_addressable = cf!(self.db, ADDRESSABLE_CF);
@@ -204,10 +191,10 @@ impl PersistStore {
             .write_batch
             .put_cf(&cf_events, event.key(), event_value.as_ref());
 
-        Ok(Some(event))
+        Ok(Some((event, deleted_event)))
     }
 
-    pub fn delete_event(&self, batch: &mut InternBatch, event: &EventRecord) {
+    fn delete_event(&self, batch: &mut InternBatch, event: &EventRecord) {
         let cf_events = cf!(self.db, EVENTS_CF);
         batch.write_batch.delete_cf(&cf_events, event.key());
 
@@ -226,24 +213,39 @@ impl PersistStore {
     }
 
     pub fn apply_updates(&self, inputs: &[PersistInputUpdate]) -> Result<()> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+
+        let mut max_ts: u64 = 0;
         let mut batch = InternBatch::new(&self.db);
-        let mut notifications: Vec<PersistUpdate> = Vec::new();
+        let mut notifications: Vec<PersistUpdate> = Vec::with_capacity(inputs.len());
 
         for (event, ts, diff) in inputs {
+            if *ts > max_ts {
+                max_ts = *ts;
+            }
+
             if *diff > 0 {
-                if let Some(event) = self.insert_event_internal(&mut batch, event)? {
+                if let Some((event, deleted)) = self.insert_event_internal(&mut batch, event)? {
+                    if let Some(old_event) = deleted {
+                        notifications.push((old_event, *ts, -1));
+                    }
                     notifications.push((event, *ts, 1));
                 }
-            } else if *diff < 0 {
-                let id = self.interner.intern_batch(&mut batch, &event.id)?;
-                if let Some(event) = self.get_event(id)? {
-                    self.delete_event(&mut batch, &event);
-                    notifications.push((event, *ts, -1));
-                }
+            } else if *diff < 0
+                && let Some(id) = self.interner.get(&self.db, &event.id)?
+                && let Some(existing) = self.get_event(id)?
+            {
+                self.delete_event(&mut batch, &existing);
+                notifications.push((existing, *ts, -1));
             }
         }
 
         self.db.write(batch.write_batch)?;
+
+        let new_upper = max_ts + 1;
+        self.save_checkpoint(new_upper)?;
 
         for (event, ts, diff) in notifications.drain(..) {
             self.notify(event, ts, diff);
@@ -306,13 +308,19 @@ impl PersistStore {
                         let lowercase = value.to_lowercase();
                         self.interner
                             .intern_batch(batch, lowercase.as_bytes())
-                            .map(EventTag::Hashtag)
+                            .map(EventTag::Topic)
                     }
-                    "d" => self
-                        .interner
-                        .intern_batch(batch, value.as_bytes())
-                        .map(EventTag::DTag),
+                    "d" => {
+                        let bytes_to_intern = (value.len() == 64)
+                            // assumes the DTag is a pubkey or a event id
+                            .then(|| hex::decode(value).ok())
+                            .flatten()
+                            .unwrap_or_else(|| value.as_bytes().to_vec());
 
+                        self.interner
+                            .intern_batch(batch, &bytes_to_intern)
+                            .map(EventTag::DTag)
+                    }
                     "bolt11" => {
                         let invoice = Bolt11Invoice::from_str(value).ok()?;
                         let amount_sats = invoice
@@ -357,6 +365,28 @@ impl PersistStore {
         let id = u32::from_be_bytes(id_bytes.try_into().unwrap());
         self.get_event(id)
     }
+
+    pub fn get_original_event(&self, event_id: u32) -> Result<Option<nostr_sdk::event::Event>> {
+        let Some(record) = self.get_event(event_id)? else {
+            return Ok(None);
+        };
+
+        let id_bytes = self
+            .interner
+            .resolve(&self.db, record.id)?
+            .ok_or_else(|| anyhow::anyhow!("missing interner entry for event id {}", record.id))?
+            .try_into()
+            .map_err(|v: Vec<u8>| anyhow::anyhow!("event id is not 32 bytes (len={})", v.len()))?;
+
+        let pubkey_bytes = self
+            .interner
+            .resolve(&self.db, record.pubkey)?
+            .ok_or_else(|| anyhow::anyhow!("missing interner entry for pubkey {}", record.pubkey))?
+            .try_into()
+            .map_err(|v: Vec<u8>| anyhow::anyhow!("pubkey is not 32 bytes (len={})", v.len()))?;
+
+        record.to_original(id_bytes, pubkey_bytes).map(Some)
+    }
 }
 
 pub fn decode_hex32(hex_bytes: &[u8]) -> Option<[u8; 32]> {
@@ -391,15 +421,16 @@ fn parse_address(
 
 #[cfg(test)]
 mod tests {
+    use crate::event::EventRaw;
+    use crate::event_raw;
     use crate::helpers::TestStore;
     use crate::query::PersistQuery;
-    use crate::tag::EventTag;
     use lightning::bitcoin::hashes::{Hash as _, sha256};
     use lightning::bitcoin::secp256k1::{Secp256k1, SecretKey};
     use lightning::bolt11_invoice::{Currency, InvoiceBuilder};
     use lightning::types::payment::{PaymentHash, PaymentSecret};
     use std::time::Duration;
-    use types::event::EventRaw;
+    use types::tags::EventTag;
 
     fn build_bolt11(sats: u64) -> String {
         let secp = Secp256k1::new();
@@ -426,20 +457,19 @@ mod tests {
 
     #[test]
     fn assert_get_event_not_found() {
-        let store = TestStore::new();
+        let store = TestStore::default();
         assert!(store.get_event(999).unwrap().is_none());
     }
 
     #[test]
     fn assert_insert_event() {
-        let store = TestStore::new();
+        let store = TestStore::default();
 
-        let raw = EventRaw {
+        let raw = event_raw! {
             id: [1u8; 32],
             pubkey: [2u8; 32],
             kind: 1,
             created_at: 1000,
-            tags_json: b"[]".to_vec(),
         };
 
         let event = store.insert_event(&raw).unwrap().unwrap();
@@ -453,15 +483,14 @@ mod tests {
 
     #[test]
     fn assert_insert_duplicate_event_returns_none() {
-        let store = TestStore::new();
+        let store = TestStore::default();
 
         let pubkey = [2u8; 32];
-        let raw = EventRaw {
+        let raw = event_raw! {
             id: [1u8; 32],
             pubkey,
             kind: 1,
             created_at: 1000,
-            tags_json: b"[]".to_vec(),
         };
 
         let event1 = store.insert_event(&raw).unwrap();
@@ -472,52 +501,20 @@ mod tests {
     }
 
     #[test]
-    fn assert_replaceable_event_newer_replaces_older() {
-        let store = TestStore::new();
-
-        let pubkey = [1u8; 32];
-
-        let old_raw = EventRaw {
-            id: [2u8; 32],
-            pubkey,
-            kind: 0,
-            created_at: 1,
-            tags_json: b"[]".to_vec(),
-        };
-        let new_raw = EventRaw {
-            id: [3u8; 32],
-            pubkey,
-            kind: 0,
-            created_at: 2,
-            tags_json: b"[]".to_vec(),
-        };
-
-        let old_event = store.insert_event(&old_raw).unwrap().unwrap();
-        let new_event = store.insert_event(&new_raw).unwrap().unwrap();
-
-        assert!(store.get_event(old_event.id).unwrap().is_none());
-        assert!(store.get_event(new_event.id).unwrap().is_some());
-    }
-
-    #[test]
     fn assert_replaceable_event_older_ignored() {
-        let store = TestStore::new();
-
+        let store = TestStore::default();
         let pubkey = [1u8; 32];
-
-        let new_raw = EventRaw {
+        let new_raw = event_raw! {
             id: [2u8; 32],
             pubkey,
             kind: 0,
             created_at: 2,
-            tags_json: b"[]".to_vec(),
         };
-        let old_raw = EventRaw {
+        let old_raw = event_raw! {
             id: [3u8; 32],
             pubkey,
             kind: 0,
             created_at: 1,
-            tags_json: b"[]".to_vec(),
         };
 
         let new_event = store.insert_event(&new_raw).unwrap().unwrap();
@@ -528,125 +525,46 @@ mod tests {
     }
 
     #[test]
-    fn assert_addressable_event_update() {
-        let store = TestStore::new();
+    fn assert_addressable_events() {
+        let store = TestStore::default();
 
         let pubkey = [1u8; 32];
 
-        let old_raw = EventRaw {
-            id: [2u8; 32],
-            pubkey,
-            kind: 30023,
-            created_at: 1000,
-            tags_json: b"[[\"d\",\"test\"]]".to_vec(),
-        };
-        let new_raw = EventRaw {
-            id: [3u8; 32],
-            pubkey,
-            kind: 30023,
-            created_at: 2000,
-            tags_json: b"[[\"d\",\"test\"]]".to_vec(),
-        };
-
-        let old_event = store.insert_event(&old_raw).unwrap().unwrap();
-        let new_event = store.insert_event(&new_raw).unwrap().unwrap();
-
-        assert!(store.get_event(old_event.id).unwrap().is_none());
-        assert!(store.get_event(new_event.id).unwrap().is_some());
-    }
-
-    #[test]
-    fn assert_addressable_event_keep() {
-        let store = TestStore::new();
-
-        let pubkey = [1u8; 32];
-
-        let raw1 = EventRaw {
+        let raw1 = event_raw! {
             id: [2u8; 32],
             pubkey,
             kind: 30023,
             created_at: 1,
             tags_json: b"[[\"d\",\"first\"]]".to_vec(),
         };
-        let raw2 = EventRaw {
+        let raw2 = event_raw! {
             id: [3u8; 32],
             pubkey,
             kind: 30023,
             created_at: 2,
-            tags_json: b"[[\"d\",\"second\"]]".to_vec(),
+            tags_json: b"[[\"d\",\"first\"]]".to_vec(),
         };
 
         let event1 = store.insert_event(&raw1).unwrap().unwrap();
         let event2 = store.insert_event(&raw2).unwrap().unwrap();
 
-        assert!(store.get_event(event1.id).unwrap().is_some());
+        assert!(store.get_event(event1.id).unwrap().is_none());
         assert!(store.get_event(event2.id).unwrap().is_some());
     }
 
     #[test]
-    fn assert_apply_updates() {
-        let store = TestStore::new();
-
-        let pubkey = [1u8; 32];
-        let ts = 0;
-        let diff = 1;
-
-        let raw_events = vec![
-            (
-                EventRaw {
-                    id: [2u8; 32],
-                    pubkey,
-                    kind: 1,
-                    created_at: 1000,
-                    tags_json: b"[]".to_vec(),
-                },
-                ts,
-                diff,
-            ),
-            (
-                EventRaw {
-                    id: [3u8; 32],
-                    pubkey,
-                    kind: 1,
-                    created_at: 1001,
-                    tags_json: b"[]".to_vec(),
-                },
-                ts,
-                diff,
-            ),
-            (
-                EventRaw {
-                    id: [4u8; 32],
-                    pubkey,
-                    kind: 1,
-                    created_at: 1002,
-                    tags_json: b"[]".to_vec(),
-                },
-                ts,
-                diff,
-            ),
-        ];
-
-        store.apply_updates(&raw_events).unwrap();
-
-        let events: Vec<_> = store.iter_events(PersistQuery::default()).collect();
-        assert_eq!(events.len(), 3);
-    }
-
-    #[test]
     fn assert_bolt11_tag_stores_sats() {
-        let store = TestStore::new();
+        let store = TestStore::default();
 
         let sats = 21_000u64;
         let invoice = build_bolt11(sats);
 
-        let raw = EventRaw {
+        let raw = event_raw! (
             id: [9u8; 32],
             pubkey: [8u8; 32],
             kind: 1,
-            created_at: 1000,
             tags_json: format!("[[\"bolt11\",\"{invoice}\"]]").into_bytes(),
-        };
+        );
 
         let event = store.insert_event(&raw).unwrap().unwrap();
         let stored = store.get_event(event.id).unwrap().unwrap();
@@ -664,15 +582,15 @@ mod tests {
 
     #[test]
     fn assert_invalid_bolt11_is_ignored() {
-        let store = TestStore::new();
+        let store = TestStore::default();
 
-        let raw = EventRaw {
+        let raw = event_raw! (
             id: [7u8; 32],
             pubkey: [6u8; 32],
             kind: 1,
             created_at: 1000,
             tags_json: b"[[\"bolt11\",\"not-a-real-invoice\"]]".to_vec(),
-        };
+        );
 
         let event = store.insert_event(&raw).unwrap().unwrap();
         let stored = store.get_event(event.id).unwrap().unwrap();
@@ -682,5 +600,144 @@ mod tests {
                 panic!("invalid bolt11 should not produce EventTag::Bolt11");
             }
         }
+    }
+
+    #[test]
+    fn assert_dtag_with_event_pubkey() {
+        let store = TestStore::default();
+
+        let pubkey = [3u8; 32];
+
+        let event_raw = event_raw! {
+            id: [1u8; 32],
+            pubkey,
+            kind: 1,
+            created_at: 1000,
+        };
+        let event_record = store.insert_event(&event_raw).unwrap().unwrap();
+
+        let addressable_raw = event_raw! (
+            id: [2u8; 32],
+            pubkey: [4u8; 32],
+            kind: 30000,
+            created_at: 1000,
+            tags_json: format!("[[\"d\",\"{}\"]]", hex::encode(pubkey)).into_bytes(),
+        );
+        let addressable_record = store.insert_event(&addressable_raw).unwrap().unwrap();
+
+        assert_eq!(addressable_record.d_tag().unwrap(), event_record.pubkey);
+    }
+
+    #[test]
+    fn assert_get_original_event() {
+        let store = TestStore::default();
+
+        let raw = event_raw! (
+            id: [1u8; 32],
+            pubkey: [2u8; 32],
+            kind: 1,
+            created_at: 1234567890,
+        );
+
+        let record = store.insert_event(&raw).unwrap().unwrap();
+        let original = store.get_original_event(record.id).unwrap().unwrap();
+
+        assert_eq!(original.id.as_bytes(), &raw.id);
+        assert_eq!(original.pubkey.as_bytes(), &raw.pubkey);
+    }
+
+    #[test]
+    fn assert_apply_updates() {
+        let store = TestStore::default();
+        let pubkey_1 = [1u8; 32];
+        let pubkey_2 = [2u8; 32];
+
+        // batch 1 at ts 100
+        let event_1 = event_raw!(id: [10u8; 32], pubkey: pubkey_1, kind: 1, created_at: 1000);
+        let event_2 = event_raw!(id: [11u8; 32], pubkey: pubkey_1, kind: 1, created_at: 1001);
+        let replaceable_1 = event_raw!(id: [20u8; 32], pubkey: pubkey_1, kind: 0, created_at: 1000);
+        let addressable_1 = event_raw!(
+            id: [30u8; 32], pubkey: pubkey_2, kind: 30023, created_at: 1000,
+            tags_json: b"[[\"d\",\"blog\"]]".to_vec()
+        );
+
+        store
+            .apply_updates(&[
+                (event_1.clone(), 100, 1),
+                (event_2.clone(), 100, 1),
+                (replaceable_1.clone(), 100, 1),
+                (addressable_1.clone(), 100, 1),
+            ])
+            .unwrap();
+
+        assert_eq!(store.load_checkpoint().unwrap(), Some(101));
+
+        // batch 2 at ts 200
+        let replaceable_2 = event_raw!(id: [21u8; 32], pubkey: pubkey_1, kind: 0, created_at: 2000);
+        let addressable_2 = event_raw!(
+            id: [31u8; 32], pubkey: pubkey_2, kind: 30023, created_at: 2000,
+            tags_json: b"[[\"d\",\"blog\"]]".to_vec()
+        );
+
+        store
+            .apply_updates(&[
+                (replaceable_2.clone(), 200, 1),
+                (addressable_2.clone(), 200, 1),
+                (event_2.clone(), 200, -1),
+            ])
+            .unwrap();
+
+        assert_eq!(store.load_checkpoint().unwrap(), Some(201));
+
+        let id = |raw: &EventRaw| store.interner.get(&store.db, &raw.id).unwrap().unwrap();
+
+        assert!(store.get_event(id(&event_1)).unwrap().is_some());
+        assert!(store.get_event(id(&replaceable_2)).unwrap().is_some());
+        assert!(store.get_event(id(&addressable_2)).unwrap().is_some());
+        // assert negatives
+        assert!(store.get_event(id(&event_2)).unwrap().is_none());
+        assert!(store.get_event(id(&replaceable_1)).unwrap().is_none());
+        assert!(store.get_event(id(&addressable_1)).unwrap().is_none());
+
+        let all_events: Vec<_> = store.iter_events(PersistQuery::default()).collect();
+        assert_eq!(all_events.len(), 3);
+    }
+
+    #[test]
+    fn assert_notifications() {
+        let store = TestStore::default();
+        let mut sub = store.subscribe();
+
+        let pubkey = [1u8; 32];
+        let old_event = event_raw!(
+            id: [2u8; 32], pubkey, kind: 30023, created_at: 1000,
+            tags_json: b"[[\"d\",\"test\"]]".to_vec()
+        );
+        let new_event = event_raw!(
+            id: [3u8; 32], pubkey, kind: 30023, created_at: 2000,
+            tags_json: b"[[\"d\",\"test\"]]".to_vec()
+        );
+
+        store.apply_updates(&[(old_event.clone(), 100, 1)]).unwrap();
+        store.apply_updates(&[(new_event.clone(), 200, 1)]).unwrap();
+
+        let notifications: Vec<_> = std::iter::from_fn(|| sub.try_recv().ok()).collect();
+        let resolve = |id| store.interner.resolve(&store.db, id).unwrap().unwrap();
+
+        // assert old_event
+        assert_eq!(
+            (&resolve(notifications[0].0.id), notifications[0].2),
+            (&old_event.id.to_vec(), 1)
+        );
+
+        // assert old_event reaction and new_event
+        assert_eq!(
+            (&resolve(notifications[1].0.id), notifications[1].2),
+            (&old_event.id.to_vec(), -1)
+        );
+        assert_eq!(
+            (&resolve(notifications[2].0.id), notifications[2].2),
+            (&new_event.id.to_vec(), 1)
+        );
     }
 }
