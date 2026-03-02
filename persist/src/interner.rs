@@ -2,6 +2,7 @@ use anyhow::Result;
 use rocksdb::{DBWithThreadMode, MultiThreaded, WriteBatch};
 use std::{
     collections::HashMap,
+    sync::Mutex,
     sync::atomic::{AtomicU32, Ordering},
 };
 
@@ -10,6 +11,7 @@ use crate::schema::{INTERN_FORWARD_CF, INTERN_REVERSE_CF, cf};
 #[derive(Debug)]
 pub struct Interner {
     next_symbol: AtomicU32,
+    write_lock: Mutex<()>,
 }
 
 /// A batch for interning multiple hashes at once.
@@ -34,7 +36,19 @@ impl Interner {
         let next_symbol = Self::find_max_symbol(db)? + 1;
         Ok(Self {
             next_symbol: AtomicU32::new(next_symbol),
+            write_lock: Mutex::new(()),
         })
+    }
+
+    pub fn get(&self, db: &DBWithThreadMode<MultiThreaded>, bytes: &[u8]) -> Result<Option<u32>> {
+        let cf_forward = cf!(db, INTERN_FORWARD_CF);
+
+        let Some(pinned) = db.get_pinned_cf(&cf_forward, bytes)? else {
+            return Ok(None);
+        };
+
+        let arr: [u8; 4] = pinned[..4].try_into().expect("must be 4 bytes");
+        Ok(Some(u32::from_be_bytes(arr)))
     }
 
     pub fn find_max_symbol(db: &DBWithThreadMode<MultiThreaded>) -> Result<u32> {
@@ -53,51 +67,55 @@ impl Interner {
         Ok(0)
     }
 
-    pub fn intern(&self, db: &DBWithThreadMode<MultiThreaded>, bytes: &[u8]) -> Result<u32> {
+    pub fn intern(&self, db: &DBWithThreadMode<MultiThreaded>, hex: &[u8]) -> Result<u32> {
         let cf_forward = cf!(db, INTERN_FORWARD_CF);
         let cf_reverse = cf!(db, INTERN_REVERSE_CF);
 
-        if let Some(pinned) = db.get_pinned_cf(&cf_forward, bytes)? {
-            let arr: [u8; 4] = pinned[..4].try_into().expect("must be 4 bytes");
-            return Ok(u32::from_be_bytes(arr));
+        if let Some(symbol) = self.get(db, hex)? {
+            return Ok(symbol);
         }
 
-        let symbol = self.next_symbol.fetch_add(1, Ordering::Relaxed);
-        let symbol_bytes = symbol.to_be_bytes();
-        let mut batch = WriteBatch::default();
-        batch.put_cf(&cf_forward, bytes, symbol_bytes);
-        batch.put_cf(&cf_reverse, symbol_bytes, bytes);
-        db.write(batch)?;
-
-        Ok(symbol)
-    }
-
-    pub fn intern_batch(&self, batch: &mut InternBatch, bytes: &[u8]) -> Result<u32> {
-        if let Some(symbol) = batch.cache.get(bytes) {
-            return Ok(*symbol);
-        }
-
-        let cf_forward = cf!(batch.db, INTERN_FORWARD_CF);
-        let cf_reverse = cf!(batch.db, INTERN_REVERSE_CF);
-
-        if let Some(pinned) = batch.db.get_pinned_cf(&cf_forward, bytes)? {
-            let array: [u8; 4] = pinned[..4]
-                .try_into()
-                .expect("forward value must be 4 bytes");
-            let symbol = u32::from_be_bytes(array);
-
-            batch.cache.entry(bytes.to_vec()).or_insert(symbol);
-
+        let _guard = self.write_lock.lock().unwrap();
+        if let Some(symbol) = self.get(db, hex)? {
             return Ok(symbol);
         }
 
         let symbol = self.next_symbol.fetch_add(1, Ordering::Relaxed);
         let symbol_bytes = symbol.to_be_bytes();
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&cf_forward, hex, symbol_bytes);
+        batch.put_cf(&cf_reverse, symbol_bytes, hex);
+        db.write(batch)?;
 
-        batch.write_batch.put_cf(&cf_forward, bytes, symbol_bytes);
-        batch.write_batch.put_cf(&cf_reverse, symbol_bytes, bytes);
+        Ok(symbol)
+    }
 
-        batch.cache.insert(bytes.to_vec(), symbol);
+    pub fn intern_batch(&self, batch: &mut InternBatch, hex: &[u8]) -> Result<u32> {
+        if let Some(symbol) = batch.cache.get(hex) {
+            return Ok(*symbol);
+        }
+
+        if let Some(symbol) = self.get(batch.db, hex)? {
+            batch.cache.insert(hex.to_vec(), symbol);
+            return Ok(symbol);
+        }
+
+        let _guard = self.write_lock.lock().unwrap();
+        if let Some(symbol) = self.get(batch.db, hex)? {
+            batch.cache.insert(hex.to_vec(), symbol);
+            return Ok(symbol);
+        }
+
+        let symbol = self.next_symbol.fetch_add(1, Ordering::Relaxed);
+        let symbol_bytes = symbol.to_be_bytes();
+        let cf_forward = cf!(batch.db, INTERN_FORWARD_CF);
+        let cf_reverse = cf!(batch.db, INTERN_REVERSE_CF);
+        let mut interner_batch = WriteBatch::default();
+        interner_batch.put_cf(&cf_forward, hex, symbol_bytes);
+        interner_batch.put_cf(&cf_reverse, symbol_bytes, hex);
+        batch.db.write(interner_batch)?;
+
+        batch.cache.insert(hex.to_vec(), symbol);
 
         Ok(symbol)
     }
@@ -122,7 +140,7 @@ mod tests {
 
     #[test]
     fn assert_interner() {
-        let store = TestStore::new();
+        let store = TestStore::default();
         let db = &store.db;
         let interner = &store.interner;
 
@@ -163,7 +181,7 @@ mod tests {
 
     #[test]
     fn assert_multithread_intern_different_bytes() {
-        let store = Arc::new(TestStore::new());
+        let store = Arc::new(TestStore::default());
         let num_threads = 8;
 
         let handles: Vec<_> = (0..num_threads)
@@ -184,7 +202,7 @@ mod tests {
 
     #[test]
     fn assert_batched_intern_same_bytes() {
-        let store = TestStore::new();
+        let store = TestStore::default();
         let mut batch = InternBatch::new(&store.db);
 
         let bytes_a = [1u8; 32];
@@ -218,5 +236,34 @@ mod tests {
 
         assert_eq!(resolved_a, bytes_a.to_vec());
         assert_eq!(resolved_b, bytes_b.to_vec());
+    }
+
+    #[test]
+    fn assert_batched_intern_same_bytes_across_batches() {
+        let store = TestStore::default();
+        let bytes = [9u8; 32];
+
+        // Simulate two concurrent writers
+        let mut batch_a = InternBatch::new(&store.db);
+        let mut batch_b = InternBatch::new(&store.db);
+
+        let symbol_a = store.interner.intern_batch(&mut batch_a, &bytes).unwrap();
+        let symbol_b = store.interner.intern_batch(&mut batch_b, &bytes).unwrap();
+
+        assert_eq!(symbol_a, symbol_b);
+
+        store.db.write(batch_a.write_batch).unwrap();
+        store.db.write(batch_b.write_batch).unwrap();
+
+        let symbol = store.interner.get(&store.db, &bytes).unwrap().unwrap();
+        assert_eq!(symbol, symbol_a);
+        assert_eq!(
+            store
+                .interner
+                .resolve(&store.db, symbol_a)
+                .unwrap()
+                .unwrap(),
+            bytes.to_vec()
+        );
     }
 }
