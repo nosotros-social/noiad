@@ -1,22 +1,23 @@
 use anyhow::Result;
-use nostrpg::NostrPg;
 use std::env;
+use transport::connection::Connection;
 
 use nostr_relay_builder::{LocalRelay, RelayBuilder, builder::RateLimit};
+
+pub mod database;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_line_number(true).init();
+
+    let client = Connection::connect("127.0.0.1:5551").await?;
 
     let port: u16 = env::var("port")
         .unwrap_or("8889".into())
         .parse()
         .expect("Invalid `port` value");
 
-    let database_url = env::var("DATABASE_URL")
-        .unwrap_or("postgres://postgres:postgres@localhost:5432/nostr".into());
-
-    let database = NostrPg::new(database_url, None).await?;
+    let database = database::DataflowDatabase::new(client);
 
     let rate_limit = RateLimit {
         max_reqs: usize::MAX,
