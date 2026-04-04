@@ -3,19 +3,21 @@ use lightning_invoice::Bolt11Invoice;
 use nostr_sdk::JsonUtil;
 use rkyv::{Archive, from_bytes, to_bytes};
 use rkyv::{Deserialize, Serialize, rancor};
+use rocksdb::WriteBatch;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::str::FromStr;
-use types::tags::EventTag;
+use types::edges::Edge;
 
 use crate::db::{PersistInputUpdate, PersistStore, PersistUpdate};
 use crate::interner::InternBatch;
-use crate::schema::{ADDRESSABLE_CF, EVENTS_CF, REPLACEABLE_CF, cf};
+use crate::schema::{ADDRESSABLE_CF, EVENT_RAW_CF, EVENTS_CF, REPLACEABLE_CF, cf};
 
-#[derive(Debug, Clone)]
+#[derive(Archive, Debug, Clone)]
 pub struct EventRaw {
     pub id: [u8; 32],
     pub pubkey: [u8; 32],
-    pub created_at: u64,
+    pub created_at: u32,
     pub content: Vec<u8>,
     pub sig: [u8; 64],
     pub kind: u16,
@@ -27,11 +29,15 @@ pub struct EventRecord {
     pub id: u32,
     pub pubkey: u32,
     pub kind: u16,
-    pub created_at: u64,
+    pub created_at: u32,
+    pub tags: Vec<Edge>,
+}
+
+#[derive(Archive, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Ord, PartialOrd)]
+pub struct EventRawRecord {
     pub content: Vec<u8>,
     pub sig: [u8; 64],
     pub raw_tags: Vec<u8>,
-    pub tags: Vec<EventTag>,
 }
 
 impl EventRecord {
@@ -65,20 +71,21 @@ impl EventRecord {
 
     pub fn d_tag(&self) -> Option<u32> {
         self.tags.iter().find_map(|e| match e {
-            EventTag::DTag(d) => Some(*d),
+            Edge::DTag(d) => Some(*d),
             _ => None,
         })
     }
 
     pub fn to_original(
         &self,
+        raw: &EventRawRecord,
         id_bytes: [u8; 32],
         pubkey_bytes: [u8; 32],
     ) -> Result<nostr_sdk::event::Event> {
-        let content = String::from_utf8(self.content.clone())
+        let content = String::from_utf8(raw.content.clone())
             .map_err(|e| anyhow::anyhow!("event content is not valid utf-8: {e}"))?;
 
-        let tags_value: Value = match serde_json::from_slice(&self.raw_tags) {
+        let tags_value: Value = match serde_json::from_slice(&raw.raw_tags) {
             Ok(Value::Array(arr)) => Value::Array(arr),
             _ => Value::Array(vec![]),
         };
@@ -90,7 +97,7 @@ impl EventRecord {
             "kind": self.kind,
             "tags": tags_value,
             "content": Value::String(content),
-            "sig": hex::encode(self.sig),
+            "sig": hex::encode(raw.sig),
         });
 
         let json = serde_json::to_string(&json_value)?;
@@ -102,8 +109,9 @@ impl EventRecord {
 
 impl PersistStore {
     pub fn get_event(&self, id: u32) -> Result<Option<EventRecord>> {
-        let cf_events = cf!(self.db, EVENTS_CF);
-        self.db
+        let event_db = self.event_db(id);
+        let cf_events = cf!(event_db, EVENTS_CF);
+        event_db
             .get_cf(&cf_events, id.to_be_bytes())?
             .map(|bytes| {
                 from_bytes::<EventRecord, rancor::Error>(&bytes).map_err(anyhow::Error::from)
@@ -111,27 +119,42 @@ impl PersistStore {
             .transpose()
     }
 
+    fn get_event_raw(&self, id: u32) -> Result<Option<EventRawRecord>> {
+        let cf_event_raw = cf!(self.db, EVENT_RAW_CF);
+        self.db
+            .get_cf(&cf_event_raw, id.to_be_bytes())?
+            .map(|bytes| {
+                from_bytes::<EventRawRecord, rancor::Error>(&bytes).map_err(anyhow::Error::from)
+            })
+            .transpose()
+    }
+
     pub fn insert_event(&self, raw: &EventRaw) -> Result<Option<EventRecord>> {
-        let mut batch = InternBatch::new(&self.db);
-        let result = self.insert_event_internal(&mut batch, raw)?;
-        self.db.write(batch.write_batch)?;
+        let mut batch = InternBatch::new(&self.db, &self.interner);
+        let mut shard_batches: HashMap<usize, WriteBatch> = HashMap::new();
+        let result = self.insert_event_internal(&mut batch, &mut shard_batches, raw)?;
+        self.db.write(std::mem::take(&mut batch.write_batch))?;
+        for (shard_id, shard_batch) in shard_batches {
+            self.event_shards[shard_id].write(shard_batch)?;
+        }
         Ok(result.map(|(event, _)| event))
     }
 
     fn insert_event_internal(
         &self,
         batch: &mut InternBatch,
+        shard_batches: &mut HashMap<usize, WriteBatch>,
         raw: &EventRaw,
     ) -> Result<Option<(EventRecord, Option<EventRecord>)>> {
-        let cf_events = cf!(self.db, EVENTS_CF);
-
-        if let Some(existing_id) = self.interner.get(&self.db, &raw.id)?
-            && self
-                .db
+        if let Some(existing_id) = self.interner.get(&self.db, &raw.id)? {
+            let event_db = self.event_db(existing_id);
+            let cf_events = cf!(event_db, EVENTS_CF);
+            if event_db
                 .get_cf(&cf_events, existing_id.to_be_bytes())?
                 .is_some()
-        {
-            return Ok(None);
+            {
+                return Ok(None);
+            }
         }
 
         let id = self.interner.intern_batch(batch, &raw.id)?;
@@ -146,10 +169,12 @@ impl PersistStore {
             pubkey,
             kind: raw.kind,
             created_at: raw.created_at,
+            tags,
+        };
+        let raw_event = EventRawRecord {
             content: raw.content.clone(),
             sig: raw.sig,
             raw_tags: raw.tags_json.clone(),
-            tags,
         };
 
         let mut deleted_event: Option<EventRecord> = None;
@@ -159,7 +184,7 @@ impl PersistStore {
                 if old_event.created_at >= event.created_at {
                     return Ok(None);
                 }
-                self.delete_event(batch, &old_event);
+                self.delete_event(batch, shard_batches, &old_event);
                 deleted_event = Some(old_event);
             }
             let cf_replaceable = cf!(self.db, REPLACEABLE_CF);
@@ -175,7 +200,7 @@ impl PersistStore {
                 if old_event.created_at >= event.created_at {
                     return Ok(None);
                 }
-                self.delete_event(batch, &old_event);
+                self.delete_event(batch, shard_batches, &old_event);
                 deleted_event = Some(old_event);
             }
             if let Some(key) = event.addressable_key() {
@@ -187,16 +212,38 @@ impl PersistStore {
         }
 
         let event_value = to_bytes::<rancor::Error>(&event)?;
+        let raw_event_value = to_bytes::<rancor::Error>(&raw_event)?;
+        let shard_id = self.shard_for_event_id(event.id);
+        let event_db = &self.event_shards[shard_id];
+        let cf_events = cf!(event_db, EVENTS_CF);
+        shard_batches.entry(shard_id).or_default().put_cf(
+            &cf_events,
+            event.key(),
+            event_value.as_ref(),
+        );
+        let cf_event_raw = cf!(self.db, EVENT_RAW_CF);
         batch
             .write_batch
-            .put_cf(&cf_events, event.key(), event_value.as_ref());
+            .put_cf(&cf_event_raw, event.key(), raw_event_value.as_ref());
 
         Ok(Some((event, deleted_event)))
     }
 
-    fn delete_event(&self, batch: &mut InternBatch, event: &EventRecord) {
-        let cf_events = cf!(self.db, EVENTS_CF);
-        batch.write_batch.delete_cf(&cf_events, event.key());
+    fn delete_event(
+        &self,
+        batch: &mut InternBatch,
+        shard_batches: &mut HashMap<usize, WriteBatch>,
+        event: &EventRecord,
+    ) {
+        let shard_id = self.shard_for_event_id(event.id);
+        let event_db = &self.event_shards[shard_id];
+        let cf_events = cf!(event_db, EVENTS_CF);
+        shard_batches
+            .entry(shard_id)
+            .or_default()
+            .delete_cf(&cf_events, event.key());
+        let cf_event_raw = cf!(self.db, EVENT_RAW_CF);
+        batch.write_batch.delete_cf(&cf_event_raw, event.key());
 
         if event.is_replaceable() {
             let cf_replaceable = cf!(self.db, REPLACEABLE_CF);
@@ -218,7 +265,8 @@ impl PersistStore {
         }
 
         let mut max_ts: u64 = 0;
-        let mut batch = InternBatch::new(&self.db);
+        let mut batch = InternBatch::new(&self.db, &self.interner);
+        let mut shard_batches: HashMap<usize, WriteBatch> = HashMap::new();
         let mut notifications: Vec<PersistUpdate> = Vec::with_capacity(inputs.len());
 
         for (event, ts, diff) in inputs {
@@ -227,7 +275,9 @@ impl PersistStore {
             }
 
             if *diff > 0 {
-                if let Some((event, deleted)) = self.insert_event_internal(&mut batch, event)? {
+                if let Some((event, deleted)) =
+                    self.insert_event_internal(&mut batch, &mut shard_batches, event)?
+                {
                     if let Some(old_event) = deleted {
                         notifications.push((old_event, *ts, -1));
                     }
@@ -237,12 +287,15 @@ impl PersistStore {
                 && let Some(id) = self.interner.get(&self.db, &event.id)?
                 && let Some(existing) = self.get_event(id)?
             {
-                self.delete_event(&mut batch, &existing);
+                self.delete_event(&mut batch, &mut shard_batches, &existing);
                 notifications.push((existing, *ts, -1));
             }
         }
 
-        self.db.write(batch.write_batch)?;
+        self.db.write(std::mem::take(&mut batch.write_batch))?;
+        for (shard_id, shard_batch) in shard_batches {
+            self.event_shards[shard_id].write(shard_batch)?;
+        }
 
         let new_upper = max_ts + 1;
         self.save_checkpoint(new_upper)?;
@@ -258,12 +311,12 @@ impl PersistStore {
         &self,
         batch: &mut InternBatch,
         tags: &[Vec<&str>],
-    ) -> Result<Vec<EventTag>> {
+    ) -> Result<Vec<Edge>> {
         tags.iter()
             .filter_map(|tag| {
                 let tag_name = *tag.first()?;
                 let value = *tag.get(1)?;
-                let edge_result: Result<EventTag> = match tag_name {
+                let edge_result: Result<Edge> = match tag_name {
                     "e" => {
                         let id_bytes = decode_hex32(value.as_bytes())?;
                         self.interner
@@ -271,44 +324,40 @@ impl PersistStore {
                             .map(|interned| {
                                 let marker = tag.get(3).copied();
                                 match marker {
-                                    Some("reply") => EventTag::Reply(interned),
-                                    Some("root") => EventTag::RootReply(interned),
-                                    _ => EventTag::Mention(interned),
+                                    Some("reply") => Edge::Reply(interned),
+                                    Some("root") => Edge::RootReply(interned),
+                                    _ => Edge::Mention(interned),
                                 }
                             })
                     }
                     "p" => {
                         let bytes = decode_hex32(value.as_bytes())?;
-                        self.interner
-                            .intern_batch(batch, &bytes)
-                            .map(EventTag::Pubkey)
+                        self.interner.intern_batch(batch, &bytes).map(Edge::Pubkey)
                     }
                     "P" => {
                         let bytes = decode_hex32(value.as_bytes())?;
                         self.interner
                             .intern_batch(batch, &bytes)
-                            .map(EventTag::PubkeyUpper)
+                            .map(Edge::PubkeyUpper)
                     }
                     "q" => {
                         if value.contains(':') {
-                            let (pubkey, address) = parse_address(value, batch, &self.interner)?;
-                            Ok(EventTag::QuoteAddress { pubkey, address })
+                            let (pubkey, _) = parse_address(value, batch, &self.interner)?;
+                            Ok(Edge::QuoteAddress(pubkey))
                         } else {
                             let bytes = decode_hex32(value.as_bytes())?;
-                            self.interner
-                                .intern_batch(batch, &bytes)
-                                .map(EventTag::Quote)
+                            self.interner.intern_batch(batch, &bytes).map(Edge::Quote)
                         }
                     }
                     "a" => {
-                        let (pubkey, address) = parse_address(value, batch, &self.interner)?;
-                        Ok(EventTag::Address { pubkey, address })
+                        let (pubkey, _) = parse_address(value, batch, &self.interner)?;
+                        Ok(Edge::Address(pubkey))
                     }
                     "t" => {
                         let lowercase = value.to_lowercase();
                         self.interner
                             .intern_batch(batch, lowercase.as_bytes())
-                            .map(EventTag::Topic)
+                            .map(Edge::Topic)
                     }
                     "d" => {
                         let bytes_to_intern = (value.len() == 64)
@@ -319,7 +368,7 @@ impl PersistStore {
 
                         self.interner
                             .intern_batch(batch, &bytes_to_intern)
-                            .map(EventTag::DTag)
+                            .map(Edge::DTag)
                     }
                     "bolt11" => {
                         let invoice = Bolt11Invoice::from_str(value).ok()?;
@@ -327,7 +376,7 @@ impl PersistStore {
                             .amount_milli_satoshis()
                             .map(|msat| msat / 1000)
                             .unwrap_or(0);
-                        Ok(EventTag::Bolt11(amount_sats))
+                        Ok(Edge::Bolt11(amount_sats))
                     }
                     _ => {
                         return None;
@@ -370,6 +419,9 @@ impl PersistStore {
         let Some(record) = self.get_event(event_id)? else {
             return Ok(None);
         };
+        let Some(raw) = self.get_event_raw(event_id)? else {
+            return Ok(None);
+        };
 
         let id_bytes = self
             .interner
@@ -385,7 +437,7 @@ impl PersistStore {
             .try_into()
             .map_err(|v: Vec<u8>| anyhow::anyhow!("pubkey is not 32 bytes (len={})", v.len()))?;
 
-        record.to_original(id_bytes, pubkey_bytes).map(Some)
+        record.to_original(&raw, id_bytes, pubkey_bytes).map(Some)
     }
 }
 
@@ -430,7 +482,7 @@ mod tests {
     use lightning::bolt11_invoice::{Currency, InvoiceBuilder};
     use lightning::types::payment::{PaymentHash, PaymentSecret};
     use std::time::Duration;
-    use types::tags::EventTag;
+    use types::edges::Edge;
 
     fn build_bolt11(sats: u64) -> String {
         let secp = Secp256k1::new();
@@ -571,7 +623,7 @@ mod tests {
 
         let mut found = None;
         for tag in stored.tags {
-            if let EventTag::Bolt11(amount) = tag {
+            if let Edge::Bolt11(amount) = tag {
                 found = Some(amount);
                 break;
             }
@@ -596,7 +648,7 @@ mod tests {
         let stored = store.get_event(event.id).unwrap().unwrap();
 
         for tag in stored.tags {
-            if let EventTag::Bolt11(_) = tag {
+            if let Edge::Bolt11(_) = tag {
                 panic!("invalid bolt11 should not produce EventTag::Bolt11");
             }
         }

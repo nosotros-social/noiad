@@ -1,6 +1,6 @@
 use rkyv::{access, deserialize, rancor};
-use rocksdb::{DBIteratorWithThreadMode, DBWithThreadMode, MultiThreaded};
-use types::{event::EventRow, tags::EventTag};
+use rocksdb::{DBIteratorWithThreadMode, DBWithThreadMode, MultiThreaded, ReadOptions};
+use types::{edges::Edge, event::EventRow};
 
 use crate::{
     db::PersistStore,
@@ -10,7 +10,8 @@ use crate::{
 };
 
 pub struct EventIterator<'a> {
-    iter: DBIteratorWithThreadMode<'a, DBWithThreadMode<MultiThreaded>>,
+    iters: Vec<DBIteratorWithThreadMode<'a, DBWithThreadMode<MultiThreaded>>>,
+    current_iter: usize,
     query: PersistQuery,
 }
 
@@ -19,7 +20,14 @@ impl<'a> Iterator for EventIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let item = self.iter.next()?;
+            let iter = self.iters.get_mut(self.current_iter)?;
+            let item = match iter.next() {
+                Some(item) => item,
+                None => {
+                    self.current_iter += 1;
+                    continue;
+                }
+            };
 
             let (_, value_bytes) = match item {
                 Ok(v) => v,
@@ -41,21 +49,20 @@ impl<'a> Iterator for EventIterator<'a> {
                 continue;
             }
 
-            let tags: Vec<EventTag> =
-                match deserialize::<Vec<EventTag>, rancor::Error>(&archived.tags) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        eprintln!("rkyv tags deserialize err: {err}");
-                        continue;
-                    }
-                };
+            let tags: Vec<Edge> = match deserialize::<Vec<Edge>, rancor::Error>(&archived.tags) {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("rkyv tags deserialize err: {err}");
+                    continue;
+                }
+            };
 
             let event = EventRow {
                 id: archived.id.to_native(),
                 pubkey: archived.pubkey.to_native(),
                 kind,
                 created_at: archived.created_at.to_native(),
-                tags,
+                edges: tags,
             };
 
             return Some(event);
@@ -88,11 +95,33 @@ impl PersistQueryIter for PersistQuery {
 
 impl PersistStore {
     pub fn iter_events(&self, query: PersistQuery) -> EventIterator<'_> {
-        let cf_events = cf!(self.db, EVENTS_CF);
-        let iter = self
-            .db
-            .iterator_cf(&cf_events, rocksdb::IteratorMode::Start);
-        EventIterator { iter, query }
+        self.iter_events_for_worker(query, 0, 1)
+    }
+
+    pub fn iter_events_for_worker(
+        &self,
+        query: PersistQuery,
+        worker_id: usize,
+        workers: usize,
+    ) -> EventIterator<'_> {
+        let iters = self
+            .event_shards
+            .iter()
+            .enumerate()
+            .filter(|(shard_idx, _)| shard_idx % workers == worker_id)
+            .map(|(_, db)| db)
+            .map(|db| {
+                let cf_events = cf!(db, EVENTS_CF);
+                let mut readopts = ReadOptions::default();
+                readopts.fill_cache(false);
+                db.iterator_cf_opt(&cf_events, readopts, rocksdb::IteratorMode::Start)
+            })
+            .collect();
+        EventIterator {
+            iters,
+            current_iter: 0,
+            query,
+        }
     }
 }
 

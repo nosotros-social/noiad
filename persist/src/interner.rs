@@ -2,31 +2,57 @@ use anyhow::Result;
 use rocksdb::{DBWithThreadMode, MultiThreaded, WriteBatch};
 use std::{
     collections::HashMap,
+    hash::{DefaultHasher, Hash, Hasher},
     sync::Mutex,
     sync::atomic::{AtomicU32, Ordering},
 };
 
 use crate::schema::{INTERN_FORWARD_CF, INTERN_REVERSE_CF, cf};
 
+const PENDING_SHARDS: usize = 64;
+
 #[derive(Debug)]
 pub struct Interner {
     next_symbol: AtomicU32,
-    write_lock: Mutex<()>,
+    pending_shards: Vec<Mutex<HashMap<Vec<u8>, (u32, usize)>>>,
 }
 
 /// A batch for interning multiple hashes at once.
 pub struct InternBatch<'a> {
     pub db: &'a DBWithThreadMode<MultiThreaded>,
+    interner: &'a Interner,
     pub write_batch: WriteBatch,
     cache: HashMap<Vec<u8>, u32>,
+    pending_keys: Vec<Vec<u8>>,
 }
 
 impl<'a> InternBatch<'a> {
-    pub fn new(db: &'a DBWithThreadMode<MultiThreaded>) -> Self {
+    pub fn new(db: &'a DBWithThreadMode<MultiThreaded>, interner: &'a Interner) -> Self {
         Self {
             db,
+            interner,
             write_batch: WriteBatch::default(),
             cache: HashMap::new(),
+            pending_keys: Vec::new(),
+        }
+    }
+}
+
+impl Drop for InternBatch<'_> {
+    fn drop(&mut self) {
+        if self.pending_keys.is_empty() {
+            return;
+        }
+
+        for key in self.pending_keys.drain(..) {
+            let shard_idx = Interner::pending_shard_index(&key);
+            let mut pending = self.interner.pending_shards[shard_idx].lock().unwrap();
+            if let Some((_, refs)) = pending.get_mut(&key) {
+                *refs -= 1;
+                if *refs == 0 {
+                    pending.remove(&key);
+                }
+            }
         }
     }
 }
@@ -36,8 +62,16 @@ impl Interner {
         let next_symbol = Self::find_max_symbol(db)? + 1;
         Ok(Self {
             next_symbol: AtomicU32::new(next_symbol),
-            write_lock: Mutex::new(()),
+            pending_shards: (0..PENDING_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
         })
+    }
+
+    fn pending_shard_index(bytes: &[u8]) -> usize {
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        (hasher.finish() as usize) % PENDING_SHARDS
     }
 
     pub fn get(&self, db: &DBWithThreadMode<MultiThreaded>, bytes: &[u8]) -> Result<Option<u32>> {
@@ -75,9 +109,13 @@ impl Interner {
             return Ok(symbol);
         }
 
-        let _guard = self.write_lock.lock().unwrap();
+        let shard_idx = Self::pending_shard_index(hex);
+        let mut pending = self.pending_shards[shard_idx].lock().unwrap();
         if let Some(symbol) = self.get(db, hex)? {
             return Ok(symbol);
+        }
+        if let Some((symbol, _)) = pending.get(hex) {
+            return Ok(*symbol);
         }
 
         let symbol = self.next_symbol.fetch_add(1, Ordering::Relaxed);
@@ -85,7 +123,9 @@ impl Interner {
         let mut batch = WriteBatch::default();
         batch.put_cf(&cf_forward, hex, symbol_bytes);
         batch.put_cf(&cf_reverse, symbol_bytes, hex);
+        pending.insert(hex.to_vec(), (symbol, 1));
         db.write(batch)?;
+        pending.remove(hex);
 
         Ok(symbol)
     }
@@ -100,9 +140,22 @@ impl Interner {
             return Ok(symbol);
         }
 
-        let _guard = self.write_lock.lock().unwrap();
+        let shard_idx = Self::pending_shard_index(hex);
+        let mut pending = self.pending_shards[shard_idx].lock().unwrap();
         if let Some(symbol) = self.get(batch.db, hex)? {
             batch.cache.insert(hex.to_vec(), symbol);
+            return Ok(symbol);
+        }
+        if let Some((symbol, refs)) = pending.get_mut(hex) {
+            let symbol = *symbol;
+            *refs += 1;
+            let symbol_bytes = symbol.to_be_bytes();
+            let cf_forward = cf!(batch.db, INTERN_FORWARD_CF);
+            let cf_reverse = cf!(batch.db, INTERN_REVERSE_CF);
+            batch.write_batch.put_cf(&cf_forward, hex, symbol_bytes);
+            batch.write_batch.put_cf(&cf_reverse, symbol_bytes, hex);
+            batch.cache.insert(hex.to_vec(), symbol);
+            batch.pending_keys.push(hex.to_vec());
             return Ok(symbol);
         }
 
@@ -110,12 +163,13 @@ impl Interner {
         let symbol_bytes = symbol.to_be_bytes();
         let cf_forward = cf!(batch.db, INTERN_FORWARD_CF);
         let cf_reverse = cf!(batch.db, INTERN_REVERSE_CF);
-        let mut interner_batch = WriteBatch::default();
-        interner_batch.put_cf(&cf_forward, hex, symbol_bytes);
-        interner_batch.put_cf(&cf_reverse, symbol_bytes, hex);
-        batch.db.write(interner_batch)?;
+        batch.write_batch.put_cf(&cf_forward, hex, symbol_bytes);
+        batch.write_batch.put_cf(&cf_reverse, symbol_bytes, hex);
 
-        batch.cache.insert(hex.to_vec(), symbol);
+        let key = hex.to_vec();
+        pending.insert(key.clone(), (symbol, 1));
+        batch.cache.insert(key.clone(), symbol);
+        batch.pending_keys.push(key);
 
         Ok(symbol)
     }
@@ -203,7 +257,7 @@ mod tests {
     #[test]
     fn assert_batched_intern_same_bytes() {
         let store = TestStore::default();
-        let mut batch = InternBatch::new(&store.db);
+        let mut batch = InternBatch::new(&store.db, &store.interner);
 
         let bytes_a = [1u8; 32];
         let bytes_b = [2u8; 32];
@@ -221,7 +275,10 @@ mod tests {
         assert_eq!(symbol_b1, symbol_b2);
         assert_ne!(symbol_a1, symbol_b1);
 
-        store.db.write(batch.write_batch).unwrap();
+        store
+            .db
+            .write(std::mem::take(&mut batch.write_batch))
+            .unwrap();
 
         let resolved_a = store
             .interner
@@ -244,16 +301,22 @@ mod tests {
         let bytes = [9u8; 32];
 
         // Simulate two concurrent writers
-        let mut batch_a = InternBatch::new(&store.db);
-        let mut batch_b = InternBatch::new(&store.db);
+        let mut batch_a = InternBatch::new(&store.db, &store.interner);
+        let mut batch_b = InternBatch::new(&store.db, &store.interner);
 
         let symbol_a = store.interner.intern_batch(&mut batch_a, &bytes).unwrap();
         let symbol_b = store.interner.intern_batch(&mut batch_b, &bytes).unwrap();
 
         assert_eq!(symbol_a, symbol_b);
 
-        store.db.write(batch_a.write_batch).unwrap();
-        store.db.write(batch_b.write_batch).unwrap();
+        store
+            .db
+            .write(std::mem::take(&mut batch_a.write_batch))
+            .unwrap();
+        store
+            .db
+            .write(std::mem::take(&mut batch_b.write_batch))
+            .unwrap();
 
         let symbol = store.interner.get(&store.db, &bytes).unwrap().unwrap();
         assert_eq!(symbol, symbol_a);
