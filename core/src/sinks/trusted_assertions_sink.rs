@@ -1,150 +1,18 @@
 use anyhow::{Error, Result};
 use differential_dataflow::VecCollection;
 use futures::StreamExt;
-use nostr_sdk::{Event, EventBuilder, EventId, Keys, Kind, PublicKey, Tag, TagKind};
-use persist::db::PersistStore;
+use nostr_sdk::Keys;
 use persist::event::EventRaw;
-use std::hash::Hash;
-use std::str::FromStr;
-use std::sync::Arc;
 use timely::container::CapacityContainerBuilder;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::{Scope, StreamCore};
-use types::types::{Diff, Node};
+use types::traits::IntoNostrEvent;
+use types::types::Diff;
 
-use crate::algorithms::trusted_assertions::TrustedAssertion;
-use crate::algorithms::trusted_assertions_event::EventAssertion;
 use crate::dataflow::DataflowConfig;
 use crate::operators::builder_async::{AsyncOperatorBuilder, Event as AsyncEvent};
-use crate::sinks::persist_sink;
-use crate::types::IntoNostrEvent;
 
 const BATCH_SIZE: usize = 20000;
-
-impl IntoNostrEvent for TrustedAssertion {
-    fn into_nostr_event(
-        self,
-        identifier: String,
-        keys: &Keys,
-        _persist_sink: &PersistStore,
-    ) -> Result<Event> {
-        let mut tags = vec![
-            Tag::identifier(&identifier),
-            Tag::custom(
-                TagKind::Custom("follower_cnt".into()),
-                [self.follower_cnt.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("post_cnt".into()),
-                [self.post_cnt.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("reply_cnt".into()),
-                [self.reply_cnt.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("reactions_cnt".into()),
-                [self.reactions_cnt.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("zap_amt_recd".into()),
-                [self.zap_amt_recd.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("zap_amt_sent".into()),
-                [self.zap_amt_sent.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("zap_cnt_recd".into()),
-                [self.zap_cnt_recd.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("zap_cnt_sent".into()),
-                [self.zap_cnt_sent.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("reports_cnt_sent".into()),
-                [self.reports_cnt_sent.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("reports_cnt_recd".into()),
-                [self.reports_cnt_recd.to_string()],
-            ),
-        ];
-        if let Some(rank) = self.rank {
-            tags.push(Tag::custom(
-                TagKind::Custom("rank".into()),
-                [rank.to_string()],
-            ));
-        }
-        if let Some(ts) = self.first_created_at {
-            tags.push(Tag::custom(
-                TagKind::Custom("first_created_at".into()),
-                [ts.to_string()],
-            ));
-        }
-        if let Some(h) = self.active_hours_start {
-            tags.push(Tag::custom(
-                TagKind::Custom("active_hours_start".into()),
-                [h.to_string()],
-            ));
-        }
-        if let Some(h) = self.active_hours_end {
-            tags.push(Tag::custom(
-                TagKind::Custom("active_hours_end".into()),
-                [h.to_string()],
-            ));
-        }
-
-        let event = EventBuilder::new(Kind::Custom(30382), "")
-            .tags(tags)
-            .sign_with_keys(keys)?;
-
-        Ok(event)
-    }
-}
-
-impl IntoNostrEvent for EventAssertion {
-    fn into_nostr_event(self, id: String, keys: &Keys, _persist: &PersistStore) -> Result<Event> {
-        let event_id = EventId::from_str(&id)?;
-
-        let tags = vec![
-            Tag::identifier(&id),
-            Tag::event(event_id),
-            Tag::custom(TagKind::Custom("rank".into()), [self.rank.to_string()]),
-            Tag::custom(
-                TagKind::Custom("comment_cnt".into()),
-                [self.comment_cnt.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("quote_cnt".into()),
-                [self.quote_cnt.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("repost_cnt".into()),
-                [self.repost_cnt.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("reaction_cnt".into()),
-                [self.reaction_cnt.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("zap_cnt".into()),
-                [self.zap_cnt.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("zap_amount".into()),
-                [self.zap_amount.to_string()],
-            ),
-        ];
-
-        let event = EventBuilder::new(Kind::Custom(30383), "")
-            .tags(tags)
-            .sign_with_keys(keys)?;
-
-        Ok(event)
-    }
-}
 
 pub fn trusted_assertion_sink<G, T>(
     scope: &G,
@@ -222,11 +90,11 @@ fn flush_assertions<T: IntoNostrEvent>(
             continue;
         }
 
-        let event = trusted_assertion.into_nostr_event(id, &keys, &config.persist)?;
+        let event = trusted_assertion.into_nostr_event(id, &keys)?;
         let event_raw = EventRaw {
             id: event.id.to_bytes(),
             pubkey: event.pubkey.to_bytes(),
-            created_at: event.created_at.as_u64(),
+            created_at: event.created_at.as_u64() as u32,
             content: event.content.into_bytes(),
             sig: event.sig.serialize(),
             kind: event.kind.as_u16(),
@@ -246,22 +114,22 @@ fn flush_assertions<T: IntoNostrEvent>(
             started.elapsed()
         );
     }
+    updates.clear();
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use nostr_sdk::{JsonUtil, Keys};
-    use persist::helpers::TestStore;
+    use nostr_sdk::{Keys, Tag, TagKind};
+    use types::{traits::IntoNostrEvent, trusted_assertions::ta_user::TrustedUser};
 
     #[test]
     fn trusted_assertion_into_nostr_event_tags_match() {
         let keys = Keys::generate();
         let identifier = keys.public_key().to_hex();
 
-        let assertion = TrustedAssertion {
+        let assertion = TrustedUser {
             follower_cnt: 10,
             rank: Some(99),
             first_created_at: Some(1_700_000_000),
@@ -280,9 +148,8 @@ mod tests {
             active_hours_end: Some(17),
         };
 
-        let persist = TestStore::default();
         let event = assertion
-            .into_nostr_event(identifier.clone(), &keys, &persist)
+            .into_nostr_event(identifier.clone(), &keys)
             .unwrap();
 
         let expected_tags = nostr_sdk::Tags::from_list(vec![

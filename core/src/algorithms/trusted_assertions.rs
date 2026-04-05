@@ -1,530 +1,692 @@
-use differential_dataflow::operators::Threshold;
-use differential_dataflow::operators::join::Join;
+use std::collections::{HashMap, HashSet};
+
+use crate::dataflow::DataflowConfig;
 use differential_dataflow::{
-    VecCollection,
-    lattice::Lattice,
-    operators::{CountTotal, Reduce},
+    AsCollection, Hashable, VecCollection, input::Input, operators::CountTotal,
 };
 use nostr_sdk::Kind;
-use persist::event::EventRecord;
 use serde::{Deserialize, Serialize};
-use timely::{dataflow::Scope, order::TotalOrder};
-use types::event::EventRow;
-use types::tags::EventTag;
-use types::types::{Diff, Edge, Node};
+use timely::{
+    PartialOrder,
+    dataflow::Scope,
+    dataflow::channels::pact::Pipeline,
+    dataflow::operators::{Capability, InputCapability},
+    dataflow::operators::{Exchange, generic::builder_rc::OperatorBuilder},
+    progress::Antichain,
+};
+use types::{
+    edges::Edge,
+    event::EventRow,
+    trusted_assertions::ta_user::{Count, TrustedUser},
+    types::{Diff, Node},
+};
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-enum TrustedPart {
-    FollowerCnt(Diff),
-    Rank(Diff),
-    FirstCreatedAt(u64),
-    PostCnt(Diff),
-    ReplyCnt(Diff),
-    ReactionsCnt(Diff),
-    ZapAmtRecd(u64),
-    ZapAmtSent(u64),
-    ZapCntRecd(Diff),
-    ZapCntSent(Diff),
-    ZapAvgAmtDayRecd(u64),
-    ZapAvgAmtDaySent(u64),
-    ReportsCntSent(Diff),
-    ReportsCntRecd(Diff),
-    // Topics(Vec<(u32, Diff)>),
-    ActiveHoursStart(u8),
-    ActiveHoursEnd(u8),
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct TrustedAssertion {
-    pub follower_cnt: Diff,
-    pub rank: Option<Diff>,
-    pub first_created_at: Option<u64>,
-    pub post_cnt: Diff,
-    pub reply_cnt: Diff,
-    pub reactions_cnt: Diff,
-    pub zap_amt_recd: u64,
-    pub zap_amt_sent: u64,
-    pub zap_cnt_recd: Diff,
-    pub zap_cnt_sent: Diff,
-    pub zap_avg_amt_day_recd: u64,
-    pub zap_avg_amt_day_sent: u64,
-    pub reports_cnt_sent: Diff,
-    pub reports_cnt_recd: Diff,
-    // pub topics: Vec<(u32, Diff)>,
-    pub active_hours_start: Option<u8>,
-    pub active_hours_end: Option<u8>,
-}
-
-const MIN_NORMALIZED_RANK: Diff = 8;
-
-/// Parameters for pagerank normalization curve
-/// https://gist.github.com/pippellia-btc/8642a25fcf535edcda1ddecd0bcd5f7b
 const PAGERANK_EXPONENT: f64 = 0.76;
 const SCORE_CURVE_EXPONENT: f64 = 0.38;
 const SCORE_BASELINE_OFFSET: f64 = 1.0 - PAGERANK_EXPONENT;
-const AVERAGE_RANK: f64 = 6_000_000.0;
+const AVERAGE_RANK: f64 = 4_000.0;
+const MIN_NORMALIZED_RANK: Diff = 0;
 
-/// Our pagerank implementation each node starts with 6,000,000 "surfers",
-/// so we use that as the average rank for normalization.
-pub fn normalize_pagerank(rank: Diff) -> Diff {
+fn normalize_pagerank(rank: Diff) -> Diff {
     if rank <= 0 {
         return 0;
     }
 
     let rank_f = rank as f64;
-
     let relative_strength = rank_f / AVERAGE_RANK;
     let denominator = relative_strength + SCORE_BASELINE_OFFSET;
     let value = 1.0 - (SCORE_BASELINE_OFFSET / denominator).powf(SCORE_CURVE_EXPONENT);
-
     let score = (value * 100.0).clamp(0.0, 100.0);
     score.round() as Diff
 }
 
-/// NIP-85 implementation
-/// https://github.com/nostr-protocol/nips/blob/master/85.md
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+struct TrustedUpdate {
+    assertion: TrustedUser,
+    rank: Option<Diff>,
+    zap_sent_day: Option<u32>,
+    zap_recd_day: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ZapSpanState {
+    min_sent_day: Option<u32>,
+    max_sent_day: Option<u32>,
+    min_recd_day: Option<u32>,
+    max_recd_day: Option<u32>,
+}
+
+macro_rules! ta_partial {
+    ($($field:ident : $value:expr),+ $(,)?) => {
+        TrustedUser {
+            $($field: $value,)+
+            ..TrustedUser::default()
+        }
+    };
+}
+
 pub fn trusted_assertions<G>(
     events: &VecCollection<G, EventRow, Diff>,
-    edges_follows: &VecCollection<G, Edge, Diff>,
-    ranks: &VecCollection<G, Node, Diff>,
-) -> VecCollection<G, (Node, TrustedAssertion), Diff>
+    config: &DataflowConfig,
+) -> (
+    VecCollection<G, (Node, TrustedUser), Diff>,
+    VecCollection<G, (Node, Node), Diff>,
+)
 where
-    G: Scope,
-    G::Timestamp: Lattice + TotalOrder,
+    G: Scope<Timestamp = u64>,
 {
-    let rank_totals = ranks.count_total();
-    // ranks from 0 to 100
-    let normalized_ranks = rank_totals.map(|(pk, rank)| (pk, normalize_pagerank(rank)));
-
-    let followers_ranked = normalized_ranks
-        .filter(|&(_pk, rank)| rank >= MIN_NORMALIZED_RANK)
-        .map(|(pk, _rank)| (pk, ()));
-
-    let follower_cnt = edges_follows
-        .join_map(&followers_ranked, |follower, &followed, &()| {
-            ((followed, *follower), ())
-        })
-        .threshold(|_, _| 1)
-        .map(|((followed, _follower), ())| followed)
-        .count_total()
-        .map(|(pk, cnt)| (pk, TrustedPart::FollowerCnt(cnt)));
-
-    let rank = normalized_ranks.map(|(pk, rank)| (pk, TrustedPart::Rank(rank)));
-
-    let first_post_time = events
-        .map(|e| (e.pubkey, e.created_at))
-        .reduce(|_pk, times, output| {
-            let mut min_time: Option<u64> = None;
-
-            for &(&created_at, diff) in times.iter() {
-                if diff <= 0 {
-                    continue;
-                }
-
-                min_time = match min_time {
-                    None => Some(created_at),
-                    Some(cur) if created_at < cur => Some(created_at),
-                    Some(cur) => Some(cur),
-                };
-            }
-
-            if let Some(ts) = min_time {
-                output.push((ts, 1));
-            }
-        })
-        .map(|(pk, ts)| (pk, TrustedPart::FirstCreatedAt(ts)));
-
-    let post_cnt = events
-        .filter(|e| e.is_root_post())
-        .map(|e| e.pubkey)
-        .count_total()
-        .map(|(pk, post_cnt)| (pk, TrustedPart::PostCnt(post_cnt)));
-
-    let reply_cnt = events
-        .filter(|e| e.is_reply())
-        .map(|e| e.pubkey)
-        .count_total()
-        .map(|(pk, reply_cnt)| (pk, TrustedPart::ReplyCnt(reply_cnt)));
-
-    let reactions_cnt = events
-        .filter(|e| e.kind == Kind::Reaction.as_u16())
-        .map(|e| e.pubkey)
-        .count_total()
-        .map(|(pk, reactions_cnt)| (pk, TrustedPart::ReactionsCnt(reactions_cnt)));
-
-    let zap_events = events
-        .filter(|e| e.kind == Kind::ZapReceipt.as_u16())
-        .flat_map(|e| {
-            let day = e.created_at / 86_400;
-
-            let mut sender: Option<Node> = None;
-            let mut recipient: Option<Node> = None;
-            let mut amount: Option<u64> = None;
-
-            for tag in &e.tags {
-                match tag {
-                    EventTag::PubkeyUpper(pubkey) => {
-                        if sender.is_none() {
-                            sender = Some(*pubkey);
-                        }
-                    }
-                    EventTag::Pubkey(pubkey) => {
-                        if recipient.is_none() {
-                            recipient = Some(*pubkey);
-                        }
-                    }
-                    EventTag::Bolt11(bolt_amount) => {
-                        amount = Some(*bolt_amount);
-                    }
-                    _ => {}
-                }
-            }
-
-            let amount = match amount {
-                Some(a) => a,
-                None => return None,
-            };
-
-            Some((sender, recipient, amount, day))
-        });
-
-    let zap_sent_by_day = zap_events
-        .flat_map(|(sender_opt, _recipient_opt, amount, day)| {
-            sender_opt.map(|sender| ((sender, day), amount))
-        })
-        .reduce(|_key, vals, output| {
-            let mut total_amt: u64 = 0;
-            let mut total_cnt: Diff = 0;
-
-            for (amt, diff) in vals.iter() {
-                if *diff <= 0 {
-                    continue;
-                }
-
-                total_amt = total_amt.saturating_add(*amt * (*diff as u64));
-                total_cnt += *diff;
-            }
-
-            if total_cnt > 0 {
-                output.push(((total_amt, total_cnt), 1));
-            }
-        });
-
-    let zap_sent_rollup = zap_sent_by_day
-        .map(|((sender, _day), (amt, cnt))| (sender, (amt, cnt, 1u64)))
-        .reduce(|_pk, vals, output| {
-            let mut total_amt: u64 = 0;
-            let mut total_cnt: Diff = 0;
-            let mut days: u64 = 0;
-
-            for &(&(amt, cnt, day_one), diff) in vals.iter() {
-                if diff <= 0 {
-                    continue;
-                }
-
-                total_amt = total_amt.saturating_add(amt.saturating_mul(diff as u64));
-                total_cnt += cnt * diff;
-                days = days.saturating_add(day_one.saturating_mul(diff as u64));
-            }
-
-            if days > 0 {
-                output.push(((total_amt, total_cnt, days), 1));
-            }
-        });
-
-    let zap_amt_sent =
-        zap_sent_rollup.map(|(pk, (amt, _cnt, _days))| (pk, TrustedPart::ZapAmtSent(amt)));
-
-    let zap_amt_recd = zap_events
-        .flat_map(|(_sender, recipient_opt, amount, _day)| {
-            recipient_opt.map(|recipient| (recipient, amount))
-        })
-        .reduce(|_pk, vals, output| {
-            let mut total: u64 = 0;
-
-            for (amt, diff) in vals.iter() {
-                if *diff <= 0 {
-                    continue;
-                }
-
-                total = total.saturating_add(*amt * (*diff as u64));
-            }
-
-            if total != 0 {
-                output.push((total, 1));
-            }
-        })
-        .map(|(pk, zap_amt_recd)| (pk, TrustedPart::ZapAmtRecd(zap_amt_recd)));
-
-    let zap_cnt_sent =
-        zap_sent_rollup.map(|(pk, (_amt, cnt, _days))| (pk, TrustedPart::ZapCntSent(cnt)));
-
-    let zap_cnt_recd = zap_events
-        .flat_map(|(_sender, recipient, _amount, _day)| recipient)
-        .count_total()
-        .map(|(pk, zap_cnt_recd)| (pk, TrustedPart::ZapCntRecd(zap_cnt_recd)));
-
-    let zap_avg_amt_day_sent = zap_sent_rollup.map(|(pk, (amt, _cnt, days))| {
-        let avg = if days == 0 { 0 } else { amt / days };
-        (pk, TrustedPart::ZapAvgAmtDaySent(avg))
-    });
-
-    let zap_recd_by_day = zap_events
-        .flat_map(|(_sender_opt, recipient_opt, amount, day)| {
-            recipient_opt.map(|recipient| ((recipient, day), amount))
-        })
-        .reduce(|_key, vals, output| {
-            let mut total: u64 = 0;
-
-            for (amt, diff) in vals.iter() {
-                if *diff <= 0 {
-                    continue;
-                }
-
-                total = total.saturating_add(*amt * (*diff as u64));
-            }
-
-            if total != 0 {
-                output.push((total, 1));
-            }
-        });
-
-    let zap_avg_amt_day_recd = zap_recd_by_day
-        .map(|((recipient, _day), amount)| (recipient, amount))
-        .reduce(|_pk, vals, output| {
-            let mut total: u64 = 0;
-            let mut days: Diff = 0;
-
-            for (amt, diff) in vals.iter() {
-                if *diff <= 0 {
-                    continue;
-                }
-
-                total = total.saturating_add(*amt * (*diff as u64));
-                days += *diff;
-            }
-
-            if days > 0 {
-                let avg = total / (days as u64);
-                if avg != 0 {
-                    output.push((avg, 1));
-                }
-            }
-        })
-        .map(|(pk, zap_avg_amt_day_recd)| {
-            (pk, TrustedPart::ZapAvgAmtDayRecd(zap_avg_amt_day_recd))
-        });
-
-    let reports_cnt_sent = events
-        .filter(|e| e.has_report())
-        .map(|e| e.pubkey)
-        .count_total()
-        .map(|(pk, reports_cnt_sent)| (pk, TrustedPart::ReportsCntSent(reports_cnt_sent)));
-
-    let reports_cnt_recd = events
-        .filter(|e| e.has_report())
-        .flat_map(|e| e.p_tags())
-        .count_total()
-        .map(|(pk, reports_cnt_recd)| (pk, TrustedPart::ReportsCntRecd(reports_cnt_recd)));
-
-    // let topic_counts = events
-    //     .flat_map(|e| e.hashtags_for_author())
-    //     .count_total()
-    //     .map(|((pk, topic), count)| (pk, (topic, count)))
-    //     .reduce(|_pk, vals, output| {
-    //         let mut topics: Vec<(u32, Diff)> = Vec::new();
-    //
-    //         for &(&(topic, count), diff) in vals.iter() {
-    //             if diff <= 0 {
-    //                 continue;
-    //             }
-    //
-    //             topics.push((topic, count));
-    //         }
-    //
-    //         if !topics.is_empty() {
-    //             output.push((topics, 1));
-    //         }
-    //     })
-    //     .map(|(pk, topics)| (pk, TrustedPart::Topics(topics)));
-
-    let active_hours = events
-        .map(|e| {
-            let hour = ((e.created_at / 3600) % 24) as u8;
-            (e.pubkey, (hour, hour))
-        })
-        .reduce(|_pk, hours, output| {
-            let mut min_h = u8::MAX;
-            let mut max_h = 0u8;
-
-            for &(&(h1, h2), diff) in hours.iter() {
-                if diff > 0 {
-                    min_h = min_h.min(h1);
-                    max_h = max_h.max(h2);
-                }
-            }
-
-            if min_h <= max_h {
-                output.push(((min_h, max_h), 1 as Diff));
-            }
-        });
-
-    let active_hours_start =
-        active_hours.map(|(pk, (h, _))| (pk, TrustedPart::ActiveHoursStart(h)));
-
-    let active_hours_end = active_hours.map(|(pk, (_, h))| (pk, TrustedPart::ActiveHoursEnd(h)));
-
-    let parts = follower_cnt
-        .concat(&first_post_time)
-        .concat(&rank)
-        .concat(&post_cnt)
-        .concat(&reply_cnt)
-        .concat(&reactions_cnt)
-        .concat(&zap_cnt_recd)
-        .concat(&zap_cnt_sent)
-        .concat(&zap_amt_recd)
-        .concat(&zap_amt_sent)
-        .concat(&zap_avg_amt_day_recd)
-        .concat(&zap_avg_amt_day_sent)
-        .concat(&reports_cnt_sent)
-        .concat(&reports_cnt_recd)
-        // .concat(&topic_counts)
-        .concat(&active_hours_start)
-        .concat(&active_hours_end);
-
-    // Merge all parts into a single TrustedAssertion per pubkey
-    parts.reduce(|_pk, vals, output| {
-        let mut agg = TrustedAssertion::default();
-
-        for (part, diff) in vals.iter() {
-            if *diff <= 0 {
-                continue;
-            }
-
-            match part {
-                TrustedPart::FollowerCnt(v) => agg.follower_cnt += v * *diff,
-                TrustedPart::Rank(v) => {
-                    agg.rank = Some(*v);
-                }
-                TrustedPart::FirstCreatedAt(ts) => {
-                    agg.first_created_at = match agg.first_created_at {
-                        None => Some(*ts),
-                        Some(cur) => Some(cur.min(*ts)),
-                    };
-                }
-                TrustedPart::PostCnt(v) => agg.post_cnt += v * *diff,
-                TrustedPart::ReplyCnt(v) => agg.reply_cnt += v * *diff,
-                TrustedPart::ReactionsCnt(v) => agg.reactions_cnt += v * *diff,
-                TrustedPart::ZapAmtRecd(v) => {
-                    agg.zap_amt_recd = agg
-                        .zap_amt_recd
-                        .saturating_add(v.saturating_mul(*diff as u64));
-                }
-                TrustedPart::ZapAmtSent(v) => {
-                    agg.zap_amt_sent = agg
-                        .zap_amt_sent
-                        .saturating_add(v.saturating_mul(*diff as u64));
-                }
-                TrustedPart::ZapCntRecd(v) => agg.zap_cnt_recd += v * *diff,
-                TrustedPart::ZapCntSent(v) => agg.zap_cnt_sent += v * *diff,
-                TrustedPart::ZapAvgAmtDayRecd(v) => {
-                    agg.zap_avg_amt_day_recd = agg
-                        .zap_avg_amt_day_recd
-                        .saturating_add(v.saturating_mul(*diff as u64));
-                }
-                TrustedPart::ZapAvgAmtDaySent(v) => {
-                    agg.zap_avg_amt_day_sent = agg
-                        .zap_avg_amt_day_sent
-                        .saturating_add(v.saturating_mul(*diff as u64));
-                }
-                TrustedPart::ReportsCntSent(v) => agg.reports_cnt_sent += v * *diff,
-                TrustedPart::ReportsCntRecd(v) => agg.reports_cnt_recd += v * *diff,
-                // TrustedPart::Topics(topics) => {
-                //     agg.topics.extend(topics.iter().cloned());
-                // }
-                TrustedPart::ActiveHoursStart(h) => {
-                    agg.active_hours_start = match agg.active_hours_start {
-                        None => Some(*h),
-                        Some(cur) => Some(cur.min(*h)),
-                    };
-                }
-                TrustedPart::ActiveHoursEnd(h) => {
-                    agg.active_hours_end = match agg.active_hours_end {
-                        None => Some(*h),
-                        Some(cur) => Some(cur.max(*h)),
-                    };
-                }
-            }
+    let follows = events.flat_map(|event| {
+        if Kind::from_u16(event.kind) != Kind::ContactList {
+            return Vec::new();
         }
 
-        output.push((agg, 1));
-    })
+        let follower = event.pubkey;
+        let mut seen = HashSet::new();
+
+        event
+            .edges
+            .into_iter()
+            .filter_map(move |edge| match edge {
+                Edge::Pubkey(followee) if seen.insert(followee) => Some((follower, followee)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let mut seed_scope = events.inner.scope();
+    let trusted_seeds = seed_scope
+        .new_collection_from(config.trusted_seeds.clone())
+        .1;
+
+    let raw_ranks =
+        crate::algorithms::pagerank::pagerank(config.pagerank_iterations, &follows, &trusted_seeds);
+
+    let rank_totals = raw_ranks
+        .count_total()
+        .map(|(pubkey, rank)| (pubkey, normalize_pagerank(rank)));
+
+    let follower_updates = filtered_follower_updates(&follows, &rank_totals);
+
+    let rank_updates = rank_totals.map(|(pubkey, rank)| {
+        (
+            pubkey,
+            TrustedUpdate {
+                rank: Some(rank),
+                ..TrustedUpdate::default()
+            },
+        )
+    });
+
+    let event_updates = events.flat_map(|event| {
+        let mut out = Vec::new();
+        let hour = ((event.created_at / 3600) % 24) as u8;
+        let day = event.created_at / 86_400;
+
+        match Kind::from_u16(event.kind) {
+            Kind::TextNote => {
+                let is_reply = event
+                    .edges
+                    .iter()
+                    .any(|edge| matches!(edge, Edge::Reply(_) | Edge::RootReply(_)));
+
+                out.push((
+                    event.pubkey,
+                    TrustedUpdate {
+                        assertion: if is_reply {
+                            ta_partial!(
+                                first_created_at: Some(event.created_at),
+                                active_hours_start: Some(hour),
+                                active_hours_end: Some(hour),
+                                reply_cnt: 1
+                            )
+                        } else {
+                            ta_partial!(
+                                first_created_at: Some(event.created_at),
+                                active_hours_start: Some(hour),
+                                active_hours_end: Some(hour),
+                                post_cnt: 1
+                            )
+                        },
+                        ..TrustedUpdate::default()
+                    },
+                ));
+            }
+            Kind::Reaction => {
+                out.push((
+                    event.pubkey,
+                    TrustedUpdate {
+                        assertion: ta_partial!(
+                            first_created_at: Some(event.created_at),
+                            active_hours_start: Some(hour),
+                            active_hours_end: Some(hour),
+                            reactions_cnt: 1
+                        ),
+                        ..TrustedUpdate::default()
+                    },
+                ));
+            }
+            Kind::Reporting => {
+                out.push((
+                    event.pubkey,
+                    TrustedUpdate {
+                        assertion: ta_partial!(
+                            first_created_at: Some(event.created_at),
+                            active_hours_start: Some(hour),
+                            active_hours_end: Some(hour),
+                            reports_cnt_sent: 1
+                        ),
+                        ..TrustedUpdate::default()
+                    },
+                ));
+                for edge in &event.edges {
+                    if let Edge::Pubkey(target) = edge {
+                        out.push((
+                            *target,
+                            TrustedUpdate {
+                                assertion: ta_partial!(reports_cnt_recd: 1),
+                                ..TrustedUpdate::default()
+                            },
+                        ));
+                    }
+                }
+            }
+            Kind::ZapReceipt => {
+                let mut sender = None;
+                let mut recipient = None;
+                let mut amount = 0u64;
+
+                for edge in &event.edges {
+                    match edge {
+                        Edge::PubkeyUpper(node) => sender = Some(*node),
+                        Edge::Pubkey(node) => recipient = Some(*node),
+                        Edge::Bolt11(amt) => amount = *amt,
+                        _ => {}
+                    }
+                }
+
+                if let Some(s) = sender {
+                    out.push((
+                        s,
+                        TrustedUpdate {
+                            assertion: ta_partial!(zap_cnt_sent: 1, zap_amt_sent: amount),
+                            zap_sent_day: Some(day),
+                            ..TrustedUpdate::default()
+                        },
+                    ));
+                }
+                if let Some(r) = recipient {
+                    out.push((
+                        r,
+                        TrustedUpdate {
+                            assertion: ta_partial!(zap_cnt_recd: 1, zap_amt_recd: amount),
+                            zap_recd_day: Some(day),
+                            ..TrustedUpdate::default()
+                        },
+                    ));
+                }
+            }
+            _ => {}
+        }
+
+        out
+    });
+
+    let updates = event_updates
+        .concat(&rank_updates)
+        .concat(&follower_updates);
+    let exchanged = updates
+        .inner
+        .exchange(|((pubkey, _update), _time, _diff)| pubkey.hashed());
+
+    (
+        accumulate_trusted_assertions(events.inner.scope(), &exchanged),
+        follows,
+    )
+}
+
+#[derive(Clone, Debug, Default)]
+struct FollowerState {
+    normalized_rank: Diff,
+    counts: bool,
+    followees: HashSet<Node>,
+}
+
+fn filtered_follower_updates<G>(
+    follows: &VecCollection<G, (Node, Node), Diff>,
+    rank_totals: &VecCollection<G, (Node, Diff), Diff>,
+) -> VecCollection<G, (Node, TrustedUpdate), Diff>
+where
+    G: Scope<Timestamp = u64>,
+{
+    let exchanged_follows = follows
+        .inner
+        .exchange(|((follower, _followee), _time, _diff)| follower.hashed());
+    let exchanged_ranks = rank_totals
+        .inner
+        .exchange(|((follower, _rank), _time, _diff)| follower.hashed());
+
+    let mut builder =
+        OperatorBuilder::new("FilteredFollowerCounts".to_string(), follows.inner.scope());
+    let mut follows_input = builder.new_input(&exchanged_follows, Pipeline);
+    let mut ranks_input = builder.new_input(&exchanged_ranks, Pipeline);
+    let (mut output_handle, output_stream) = builder.new_output();
+
+    builder.build(move |_initial_capabilities| {
+        let mut emitted_frontier = Antichain::from_elem(0u64);
+        let mut retained_cap: Option<Capability<u64>> = None;
+        let mut follower_states: HashMap<Node, FollowerState> = HashMap::new();
+        let mut deltas: HashMap<Node, Count> = HashMap::new();
+        let mut cleanup_candidates: HashSet<Node> = HashSet::new();
+
+        move |frontiers| {
+            follows_input.for_each(
+                |capability: InputCapability<u64>, batches: &mut Vec<((Node, Node), u64, Diff)>| {
+                    if retained_cap.is_none() {
+                        retained_cap = Some(capability.retain());
+                    }
+
+                    for ((follower, followee), _time, diff) in batches.drain(..) {
+                        let state = follower_states.entry(follower).or_default();
+
+                        if diff > 0 {
+                            if state.followees.insert(followee) && state.counts {
+                                *deltas.entry(followee).or_default() += 1;
+                            }
+                        } else if state.followees.remove(&followee) && state.counts {
+                            *deltas.entry(followee).or_default() -= 1;
+                        }
+
+                        if state.normalized_rank == 0 && state.followees.is_empty() {
+                            cleanup_candidates.insert(follower);
+                        } else {
+                            cleanup_candidates.remove(&follower);
+                        }
+                    }
+                },
+            );
+
+            ranks_input.for_each(
+                |capability: InputCapability<u64>, batches: &mut Vec<((Node, Diff), u64, Diff)>| {
+                    if retained_cap.is_none() {
+                        retained_cap = Some(capability.retain());
+                    }
+
+                    for ((follower, normalized_rank), _time, diff) in batches.drain(..) {
+                        let state = follower_states.entry(follower).or_default();
+                        let old_counts = state.counts;
+
+                        if diff > 0 {
+                            state.normalized_rank = normalized_rank;
+                        } else if state.normalized_rank == normalized_rank {
+                            state.normalized_rank = 0;
+                        }
+
+                        state.counts = state.normalized_rank >= MIN_NORMALIZED_RANK;
+
+                        if old_counts != state.counts {
+                            let follower_diff = if state.counts { 1 } else { -1 };
+                            for &followee in &state.followees {
+                                *deltas.entry(followee).or_default() += follower_diff;
+                            }
+                        }
+
+                        if state.normalized_rank == 0 && state.followees.is_empty() {
+                            cleanup_candidates.insert(follower);
+                        } else {
+                            cleanup_candidates.remove(&follower);
+                        }
+                    }
+                },
+            );
+
+            let frontier_min = frontiers
+                .iter()
+                .filter_map(|input| input.frontier().iter().min().copied())
+                .min();
+
+            let Some(frontier_min) = frontier_min else {
+                retained_cap = None;
+                emitted_frontier.clear();
+                return;
+            };
+
+            let input_frontier = Antichain::from_elem(frontier_min);
+
+            if !PartialOrder::less_than(&emitted_frontier.borrow(), &input_frontier.borrow()) {
+                return;
+            }
+
+            emitted_frontier.clear();
+            emitted_frontier.insert(frontier_min);
+
+            let cap = match retained_cap.as_mut() {
+                Some(c) => c,
+                None => return,
+            };
+
+            let emit_time = frontier_min.saturating_sub(1).max(*cap.time());
+            cap.downgrade(&emit_time);
+
+            for follower in cleanup_candidates.drain() {
+                let should_remove = follower_states
+                    .get(&follower)
+                    .map(|state| state.normalized_rank == 0 && state.followees.is_empty())
+                    .unwrap_or(false);
+                if should_remove {
+                    follower_states.remove(&follower);
+                }
+            }
+
+            if deltas.is_empty() {
+                cap.downgrade(&frontier_min);
+                return;
+            }
+
+            let mut output_activated = output_handle.activate();
+            let mut updates: Vec<((Node, TrustedUpdate), u64, Diff)> = Vec::new();
+
+            for (followee, delta) in deltas.drain() {
+                if delta == 0 {
+                    continue;
+                }
+
+                updates.push((
+                    (
+                        followee,
+                        TrustedUpdate {
+                            assertion: ta_partial!(follower_cnt: 1),
+                            ..TrustedUpdate::default()
+                        },
+                    ),
+                    emit_time,
+                    delta as Diff,
+                ));
+            }
+
+            if !updates.is_empty() {
+                output_activated.give(cap, &mut updates);
+            }
+
+            cap.downgrade(&frontier_min);
+        }
+    });
+
+    output_stream.as_collection()
+}
+
+fn recompute_zap_averages(assertion: &mut TrustedUser, span: &ZapSpanState) {
+    assertion.zap_avg_amt_day_sent = match (span.min_sent_day, span.max_sent_day) {
+        (Some(min), Some(max)) => {
+            let days = (max - min + 1) as u64;
+            assertion.zap_amt_sent / days.max(1)
+        }
+        _ => 0,
+    };
+
+    assertion.zap_avg_amt_day_recd = match (span.min_recd_day, span.max_recd_day) {
+        (Some(min), Some(max)) => {
+            let days = (max - min + 1) as u64;
+            assertion.zap_amt_recd / days.max(1)
+        }
+        _ => 0,
+    };
+}
+
+fn accumulate_trusted_assertions<G>(
+    scope: G,
+    exchanged: &timely::dataflow::StreamCore<G, Vec<((Node, TrustedUpdate), u64, Diff)>>,
+) -> VecCollection<G, (Node, TrustedUser), Diff>
+where
+    G: Scope<Timestamp = u64>,
+{
+    let worker_id = scope.index();
+    let mut builder = OperatorBuilder::new("TrustedAssertionsAccumulate".to_string(), scope);
+    let mut partial_input = builder.new_input(exchanged, Pipeline);
+    let (mut output_handle, output_stream) = builder.new_output();
+
+    builder.build(move |_initial_capabilities| {
+        let mut emitted_frontier = Antichain::from_elem(0u64);
+        let mut retained_cap: Option<Capability<u64>> = None;
+        let mut emitted: HashMap<Node, TrustedUser> = HashMap::new();
+        let mut pending: HashMap<Node, TrustedUser> = HashMap::new();
+        let mut zap_spans: HashMap<Node, ZapSpanState> = HashMap::new();
+        let mut dirty_pubkeys: HashSet<Node> = HashSet::new();
+
+        move |frontiers| {
+            partial_input.for_each(
+                |capability: InputCapability<u64>,
+                 batches: &mut Vec<((Node, TrustedUpdate), u64, Diff)>| {
+                    if retained_cap.is_none() {
+                        retained_cap = Some(capability.retain());
+                    }
+
+                    for ((pubkey, update), _time, diff) in batches.drain(..) {
+                        dirty_pubkeys.insert(pubkey);
+                        let entry = pending
+                            .entry(pubkey)
+                            .or_insert_with(|| emitted.get(&pubkey).cloned().unwrap_or_default());
+                        entry.apply(&update.assertion, diff);
+                        if let Some(rank) = update.rank {
+                            if diff > 0 {
+                                entry.rank = Some(rank);
+                            } else if entry.rank == Some(rank) {
+                                entry.rank = None;
+                            }
+                        }
+
+                        let has_zap_day =
+                            update.zap_sent_day.is_some() || update.zap_recd_day.is_some();
+                        let has_zap_amt =
+                            update.assertion.zap_amt_sent > 0 || update.assertion.zap_amt_recd > 0;
+
+                        if has_zap_day {
+                            let span = zap_spans.entry(pubkey).or_default();
+                            if diff > 0 {
+                                if let Some(day) = update.zap_sent_day {
+                                    span.min_sent_day =
+                                        Some(span.min_sent_day.map_or(day, |v| v.min(day)));
+                                    span.max_sent_day =
+                                        Some(span.max_sent_day.map_or(day, |v| v.max(day)));
+                                }
+                                if let Some(day) = update.zap_recd_day {
+                                    span.min_recd_day =
+                                        Some(span.min_recd_day.map_or(day, |v| v.min(day)));
+                                    span.max_recd_day =
+                                        Some(span.max_recd_day.map_or(day, |v| v.max(day)));
+                                }
+                            }
+                            recompute_zap_averages(entry, span);
+                        } else if has_zap_amt {
+                            if let Some(span) = zap_spans.get(&pubkey) {
+                                recompute_zap_averages(entry, span);
+                            }
+                        }
+                    }
+                },
+            );
+
+            let frontier_min = frontiers
+                .iter()
+                .filter_map(|input| input.frontier().iter().min().copied())
+                .min();
+
+            let Some(frontier_min) = frontier_min else {
+                retained_cap = None;
+                emitted_frontier.clear();
+                return;
+            };
+
+            let input_frontier = Antichain::from_elem(frontier_min);
+
+            if !PartialOrder::less_than(&emitted_frontier.borrow(), &input_frontier.borrow()) {
+                return;
+            }
+
+            emitted_frontier.clear();
+            emitted_frontier.insert(frontier_min);
+
+            let cap = match retained_cap.as_mut() {
+                Some(c) => c,
+                None => return,
+            };
+
+            let emit_time = frontier_min.saturating_sub(1).max(*cap.time());
+            cap.downgrade(&emit_time);
+
+            if dirty_pubkeys.is_empty() {
+                cap.downgrade(&frontier_min);
+                return;
+            }
+
+            let mut output_activated = output_handle.activate();
+            let mut updates: Vec<((Node, TrustedUser), u64, Diff)> = Vec::new();
+
+            for pubkey in dirty_pubkeys.drain() {
+                let new_val = pending
+                    .remove(&pubkey)
+                    .unwrap_or_else(|| emitted.get(&pubkey).cloned().unwrap_or_default());
+                let old_val = emitted.get(&pubkey).cloned().unwrap_or_default();
+
+                if old_val == new_val {
+                    continue;
+                }
+
+                if !old_val.is_empty() {
+                    updates.push(((pubkey, old_val), emit_time, -1));
+                }
+
+                if new_val.is_empty() {
+                    emitted.remove(&pubkey);
+                    zap_spans.remove(&pubkey);
+                } else {
+                    updates.push(((pubkey, new_val.clone()), emit_time, 1));
+                    emitted.insert(pubkey, new_val);
+                }
+            }
+
+            if !updates.is_empty() {
+                tracing::info!(
+                    "[Worker {}] trusted_assertions emitting {} updates at ts={} next_frontier={}",
+                    worker_id,
+                    updates.len(),
+                    emit_time,
+                    frontier_min
+                );
+                output_activated.give(cap, &mut updates);
+            }
+
+            cap.downgrade(&frontier_min);
+        }
+    });
+
+    output_stream.as_collection()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use differential_dataflow::input::InputSession;
+    use persist::db::PersistStore;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::channel;
+    use std::sync::{Arc, Mutex};
     use timely::dataflow::operators::Capture;
     use timely::dataflow::operators::capture::Extract;
     use timely::dataflow::operators::probe::Handle as ProbeHandle;
-    use timely::execute_directly;
-    use types::edges::EdgeLabel;
+    use types::edges::Edge;
+    use types::event::EventRow;
 
-    use crate::algorithms::pagerank::pagerank;
+    use crate::dataflow::{DataflowConfig, TimelyConfig};
 
     const PUBKEY1: Node = 1;
     const PUBKEY2: Node = 2;
-    const PUBKEY3: Node = 3;
-    const PUBKEY4: Node = 4;
-    const PUBKEY5: Node = 5;
-    const PUBKEY_LN: Node = 9;
+    static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    const HASHTAG_NOSTR: u32 = 400;
-    const HASHTAG_WOT: u32 = 401;
+    fn test_config(trusted_seeds: Vec<Node>) -> DataflowConfig {
+        let suffix = TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path: PathBuf = std::env::temp_dir().join(format!(
+            "noiad-trusted-assertions2-test-{}-{}",
+            std::process::id(),
+            suffix
+        ));
+        let persist = Arc::new(PersistStore::open(&path).expect("failed to open test persist"));
 
-    fn build_dataflow<FBuild>(build_inputs: FBuild) -> Vec<(Node, TrustedAssertion, u64, Diff)>
+        DataflowConfig {
+            timely: TimelyConfig { workers: 4 },
+            persist,
+            pagerank_iterations: 20,
+            pagerank_sink_batch_size: 0,
+            replication_max_pending: 0,
+            trusted_assertions_nsec: None,
+            embedding_import_manifest: None,
+            dataset_sink_path: None,
+            trusted_seeds,
+            trusted_lists_ranks_k: 0,
+        }
+    }
+
+    fn build_dataflow<FBuild>(
+        trusted_seeds: Vec<Node>,
+        build_inputs: FBuild,
+    ) -> Vec<(Node, TrustedUser, u64, Diff)>
     where
         FBuild: FnOnce(&mut InputSession<u64, EventRow, Diff>) + Send + Sync + 'static,
     {
         let (tx, rx) = channel();
+        let build_inputs = Arc::new(Mutex::new(Some(build_inputs)));
+        let final_ts = Arc::new(AtomicU64::new(0));
+        let config = test_config(trusted_seeds);
 
-        execute_directly(move |worker| {
+        let guards = timely::execute(timely::Config::process(4), move |worker| {
             let mut events_input: InputSession<u64, EventRow, Diff> = InputSession::new();
             let probe = ProbeHandle::new();
+            let tx = tx.clone();
+            let build_inputs = Arc::clone(&build_inputs);
+            let final_ts = Arc::clone(&final_ts);
+            let worker_idx = worker.index();
+            let config = config.clone();
 
             worker.dataflow::<u64, _, _>(|scope| {
                 let events = events_input.to_collection(scope);
-                let follows = events
-                    .flat_map(|e| e.to_edges())
-                    .filter(|&(kind, _, _, _)| kind == Kind::ContactList.as_u16())
-                    .filter(|&(_, _, _, label)| label == EdgeLabel::Pubkey)
-                    .map(|(_, from, to, _)| (from, to));
-
-                let ranks = pagerank(20, &follows);
-
-                let assertions = trusted_assertions(&events, &follows, &ranks);
-
+                let (assertions, _) = trusted_assertions(&events, &config);
                 assertions.probe_with(&probe).inner.capture_into(tx);
             });
 
             events_input.advance_to(1);
-
-            build_inputs(&mut events_input);
-
+            if worker_idx == 0 {
+                let f = build_inputs
+                    .lock()
+                    .expect("build_inputs mutex poisoned")
+                    .take()
+                    .expect("build_inputs should run once");
+                f(&mut events_input);
+            }
             events_input.flush();
 
-            let mut final_ts = *events_input.time();
-            final_ts += 1;
+            if worker_idx == 0 {
+                let ts = (*events_input.time()).saturating_add(1);
+                final_ts.store(ts, Ordering::SeqCst);
+            }
 
-            events_input.advance_to(final_ts);
+            let target_ts = loop {
+                let ts = final_ts.load(Ordering::SeqCst);
+                if ts > 0 {
+                    break ts;
+                }
+                worker.step();
+            };
+
+            events_input.advance_to(target_ts);
             events_input.flush();
 
-            while probe.less_than(&final_ts) {
+            while probe.less_than(&target_ts) {
                 worker.step();
             }
-        });
+        })
+        .expect("failed to execute timely workers");
+
+        drop(guards);
 
         rx.extract()
             .into_iter()
@@ -536,421 +698,330 @@ mod tests {
             .collect()
     }
 
-    fn get_captured_by_pubkey(
-        captured: &[(Node, TrustedAssertion, u64, Diff)],
+    fn latest_assertion_for_pubkey(
+        captured: &[(Node, TrustedUser, u64, Diff)],
         pubkey: Node,
-    ) -> Vec<(Node, TrustedAssertion, u64, Diff)> {
-        let mut res = captured
+    ) -> TrustedUser {
+        captured
             .iter()
-            .filter(|(p, _res, _, diff)| *p == pubkey && *diff > 0)
-            .cloned()
-            .collect::<Vec<_>>();
-        res.sort_by_key(|(_, _, ts, _)| *ts);
-        res
+            .filter(|(p, _res, _ts, diff)| *p == pubkey && *diff > 0)
+            .max_by_key(|(_, _res, ts, _)| *ts)
+            .map(|(_, res, _, _)| res.clone())
+            .expect("expected assertion for pubkey")
     }
 
     #[test]
-    fn assert_trusted_assertions_for_pubkey() {
-        let captured = build_dataflow(|events_input| {
-            // Follow events
+    fn assert_reports() {
+        let captured = build_dataflow(vec![], |events_input| {
             events_input.insert(EventRow {
-                id: 30,
-                pubkey: PUBKEY1,
-                created_at: 2 * 3600,
-                kind: Kind::ContactList.as_u16(),
-                tags: vec![EventTag::Pubkey(PUBKEY2)],
-            });
-            events_input.insert(EventRow {
-                id: 31,
-                pubkey: PUBKEY2,
-                created_at: 10 * 3600,
-                kind: Kind::ContactList.as_u16(),
-                tags: vec![EventTag::Pubkey(PUBKEY1)],
-            });
-            events_input.insert(EventRow {
-                id: 32,
-                pubkey: PUBKEY3,
-                created_at: 7 * 3600,
-                kind: Kind::ContactList.as_u16(),
-                tags: vec![EventTag::Pubkey(PUBKEY1)],
-            });
-
-            // pubkey1 root posts
-            events_input.insert(EventRow {
-                id: 10,
-                pubkey: PUBKEY1,
-                created_at: 3600,
-                kind: Kind::TextNote.as_u16(),
-                tags: vec![EventTag::Topic(HASHTAG_NOSTR)],
-            });
-            events_input.insert(EventRow {
-                id: 11,
-                pubkey: PUBKEY1,
-                created_at: 3 * 3600,
-                kind: Kind::TextNote.as_u16(),
-                tags: vec![EventTag::Topic(HASHTAG_WOT)],
-            });
-
-            // pubkey1 replies at hour 20
-            events_input.insert(EventRow {
-                id: 12,
-                pubkey: PUBKEY1,
-                created_at: 20 * 3600,
-                kind: Kind::TextNote.as_u16(),
-                tags: vec![EventTag::Reply(9)],
-            });
-
-            // pubkey1 reacts to note 10 from pubkey1
-            events_input.insert(EventRow {
-                id: 13,
-                pubkey: PUBKEY1,
-                created_at: 21 * 3600,
-                kind: Kind::Reaction.as_u16(),
-                tags: vec![EventTag::Mention(10), EventTag::Pubkey(PUBKEY1)],
-            });
-
-            // pubkey1 reacts to note 11 from pubkey1
-            events_input.insert(EventRow {
-                id: 14,
-                pubkey: PUBKEY1,
-                created_at: 22 * 3600,
-                kind: Kind::Reaction.as_u16(),
-                tags: vec![EventTag::Mention(11), EventTag::Pubkey(PUBKEY1)],
-            });
-
-            // pubkey1 reports pubkey2
-            events_input.insert(EventRow {
-                id: 15,
-                pubkey: PUBKEY1,
-                created_at: 23 * 3600,
-                kind: Kind::Reporting.as_u16(),
-                tags: vec![EventTag::Pubkey(PUBKEY2)],
-            });
-
-            events_input.insert(EventRow {
-                id: 16,
-                pubkey: PUBKEY2,
-                created_at: 5 * 3600,
-                kind: Kind::TextNote.as_u16(),
-                tags: vec![EventTag::Pubkey(PUBKEY1)],
-            });
-
-            events_input.insert(EventRow {
-                id: 17,
-                pubkey: PUBKEY3,
-                created_at: 6 * 3600,
-                kind: Kind::TextNote.as_u16(),
-                tags: vec![EventTag::Pubkey(PUBKEY1)],
-            });
-
-            events_input.insert(EventRow {
-                id: 18,
-                pubkey: PUBKEY3,
-                created_at: 7 * 3600,
-                kind: Kind::TextNote.as_u16(),
-                tags: vec![],
-            });
-
-            events_input.insert(EventRow {
-                id: 19,
-                pubkey: PUBKEY3,
-                created_at: 8 * 3600,
-                kind: Kind::Reaction.as_u16(),
-                tags: vec![],
-            });
-
-            // pubkey1 zaps pubkey2 1000 sats
-            events_input.insert(EventRow {
-                id: 20,
-                pubkey: PUBKEY_LN,
-                created_at: 9 * 3600,
-                kind: Kind::ZapReceipt.as_u16(),
-                tags: vec![
-                    EventTag::Pubkey(PUBKEY2),
-                    EventTag::PubkeyUpper(PUBKEY1),
-                    EventTag::Bolt11(1000),
-                ],
-            });
-            // pubkey2 zaps pubkey1 2000 sats
-            events_input.insert(EventRow {
-                id: 21,
-                pubkey: PUBKEY_LN,
-                created_at: 10 * 3600,
-                kind: Kind::ZapReceipt.as_u16(),
-                tags: vec![
-                    EventTag::Pubkey(PUBKEY1),
-                    EventTag::PubkeyUpper(PUBKEY2),
-                    EventTag::Bolt11(2000),
-                ],
-            });
-        });
-
-        let get_assertion = |pubkey: Node| {
-            get_captured_by_pubkey(&captured, pubkey)
-                .into_iter()
-                .next()
-                .map(|(_, res, _, _)| res)
-                .unwrap()
-        };
-
-        let res1 = get_assertion(PUBKEY1);
-        let res2 = get_assertion(PUBKEY2);
-        let res3 = get_assertion(PUBKEY3);
-
-        // pubkey1
-        {
-            // let mut topics = res1.topics.clone();
-            // topics.sort();
-            // let mut expected_topics = vec![(HASHTAG_WOT, 1), (HASHTAG_NOSTR, 1)];
-            // let mut expected_topics = vec![];
-            // expected_topics.sort();
-
-            let expected = TrustedAssertion {
-                follower_cnt: 2,
-                rank: Some(52),
-                first_created_at: Some(3600),
-                post_cnt: 2,
-                reply_cnt: 1,
-                reactions_cnt: 2,
-                zap_amt_sent: 1_000,
-                zap_cnt_sent: 1,
-                zap_avg_amt_day_sent: 1_000,
-                zap_amt_recd: 2_000,
-                zap_cnt_recd: 1,
-                zap_avg_amt_day_recd: 2_000,
-                reports_cnt_sent: 1,
-                reports_cnt_recd: 0,
-                // topics: expected_topics.clone(),
-                active_hours_start: Some(1),
-                active_hours_end: Some(23),
-            };
-
-            // let mut res1_sorted = res1.clone();
-            // res1_sorted.topics = topics;
-
-            // assert_eq!(expected_topics, res1_sorted.topics);
-            assert_eq!(res1, expected);
-        }
-
-        // pubkey2
-        {
-            let expected = TrustedAssertion {
-                follower_cnt: 1,
-                rank: Some(52),
-                first_created_at: Some(5 * 3600),
-                post_cnt: 1,
-                reply_cnt: 0,
-                reactions_cnt: 0,
-                zap_amt_sent: 2_000,
-                zap_cnt_sent: 1,
-                zap_avg_amt_day_sent: 2_000,
-                zap_amt_recd: 1_000,
-                zap_cnt_recd: 1,
-                zap_avg_amt_day_recd: 1_000,
-                reports_cnt_sent: 0,
-                reports_cnt_recd: 1,
-                // topics: vec![],
-                active_hours_start: Some(5),
-                active_hours_end: Some(10),
-            };
-
-            assert_eq!(expected, res2);
-        }
-
-        // pubkey3
-        {
-            let expected = TrustedAssertion {
-                first_created_at: Some(21600),
-                rank: Some(18),
-                post_cnt: 2,
-                reactions_cnt: 1,
-                active_hours_start: Some(6),
-                active_hours_end: Some(8),
-                ..Default::default()
-            };
-
-            assert_eq!(expected, res3);
-        }
-    }
-
-    #[test]
-    fn assert_follow_edges_inserts_and_deletes() {
-        let captured = build_dataflow(|events_input| {
-            events_input.insert(EventRow {
-                id: 1,
-                pubkey: PUBKEY2,
-                created_at: 2000,
-                kind: Kind::ContactList.as_u16(),
-                tags: vec![EventTag::Pubkey(PUBKEY1)],
-            });
-
-            events_input.insert(EventRow {
-                id: 2,
-                pubkey: PUBKEY1,
-                created_at: 2000,
-                kind: Kind::ContactList.as_u16(),
-                tags: vec![EventTag::Pubkey(PUBKEY2)],
-            });
-
-            events_input.insert(EventRow {
-                id: 3,
-                pubkey: PUBKEY3,
-                created_at: 2000,
-                kind: Kind::ContactList.as_u16(),
-                tags: vec![EventTag::Pubkey(PUBKEY4)],
-            });
-            events_input.insert(EventRow {
-                id: 4,
-                pubkey: PUBKEY4,
-                created_at: 2000,
-                kind: Kind::ContactList.as_u16(),
-                tags: vec![EventTag::Pubkey(PUBKEY5)],
-            });
-            events_input.flush();
-
-            // pubkey1 unfollows pubkey2 at timestamp 2
-            events_input.advance_to(2);
-            events_input.remove(EventRow {
-                id: 2,
-                pubkey: PUBKEY1,
-                created_at: 2000,
-                kind: Kind::ContactList.as_u16(),
-                tags: vec![EventTag::Pubkey(PUBKEY2)],
-            });
-            events_input.flush();
-
-            // pubkey1 follows pubkey2 again at timestamp 3
-            events_input.advance_to(3);
-
-            events_input.insert(EventRow {
-                id: 4,
-                pubkey: PUBKEY1,
-                created_at: 4000,
-                kind: Kind::ContactList.as_u16(),
-                tags: vec![EventTag::Pubkey(PUBKEY2)],
-            });
-
-            events_input.flush();
-        });
-
-        let get_rank_from_pubkey = |pubkey: Node| {
-            get_captured_by_pubkey(&captured, pubkey)
-                .iter()
-                .map(|(_, res, ts, _)| (*ts, res.rank.unwrap()))
-                .collect::<Vec<_>>()
-        };
-        let pubkey1_data = get_rank_from_pubkey(PUBKEY1);
-        let pubkey2_data = get_rank_from_pubkey(PUBKEY2);
-        let pubkey3_data = get_rank_from_pubkey(PUBKEY3);
-        let pubkey4_data = get_rank_from_pubkey(PUBKEY4);
-
-        // (timestamp, rank)
-        assert_eq!(pubkey1_data, vec![(1, 46), (2, 27), (3, 46)]);
-        assert_eq!(pubkey2_data, vec![(1, 46), (2, 18), (3, 46)]);
-        // It's important to make sure that pubkey3 and pubkey4 ranks are unchanged
-        assert_eq!(pubkey3_data, vec![(1, 18)]);
-        assert_eq!(pubkey4_data, vec![(1, 27)]);
-    }
-
-    #[test]
-    fn assert_normalize_pagerank() {
-        assert_eq!(normalize_pagerank(0 as Diff), 0);
-        assert_eq!(normalize_pagerank(-1 as Diff), 0);
-        assert_eq!(normalize_pagerank(1_000_000 as Diff), 18);
-        assert_eq!(normalize_pagerank(3_000_000 as Diff), 35);
-        assert_eq!(normalize_pagerank(6_000_000 as Diff), 46);
-        assert_eq!(normalize_pagerank(12_000_000 as Diff), 57);
-        assert_eq!(normalize_pagerank(21_000_000 as Diff), 65);
-        assert_eq!(normalize_pagerank(120_000_000 as Diff), 81);
-        assert_eq!(normalize_pagerank(600_000_000 as Diff), 90);
-    }
-
-    const PUBKEY_NO_EVENTS: Node = 7;
-
-    #[test]
-    fn assert_pubkey_without_events() {
-        let captured = build_dataflow(|events_input| {
-            events_input.insert(EventRow {
-                id: 42,
+                id: 100,
                 pubkey: PUBKEY1,
                 created_at: 1_000,
                 kind: Kind::Reporting.as_u16(),
-                tags: vec![EventTag::Pubkey(PUBKEY_NO_EVENTS)],
+                edges: vec![Edge::Pubkey(PUBKEY2)],
+            });
+            events_input.insert(EventRow {
+                id: 101,
+                pubkey: PUBKEY1,
+                created_at: 2_000,
+                kind: Kind::Reporting.as_u16(),
+                edges: vec![Edge::Pubkey(PUBKEY2)],
+            });
+            events_input.flush();
+
+            events_input.advance_to(2);
+            events_input.remove(EventRow {
+                id: 101,
+                pubkey: PUBKEY1,
+                created_at: 2_000,
+                kind: Kind::Reporting.as_u16(),
+                edges: vec![Edge::Pubkey(PUBKEY2)],
             });
         });
 
-        let rows = get_captured_by_pubkey(&captured, PUBKEY_NO_EVENTS);
-        assert_eq!(rows.len(), 1);
+        let sender = latest_assertion_for_pubkey(&captured, PUBKEY1);
+        assert_eq!(sender.reports_cnt_sent, 1);
 
-        let (pk, assertion, _, _) = &rows[0];
-
-        let expected = TrustedAssertion {
-            reports_cnt_recd: 1,
-            first_created_at: None,
-            ..Default::default()
-        };
-
-        assert_eq!(*pk, PUBKEY_NO_EVENTS);
-        assert_eq!(*assertion, expected);
+        let recipient = latest_assertion_for_pubkey(&captured, PUBKEY2);
+        assert_eq!(recipient.reports_cnt_recd, 1);
     }
 
     #[test]
     fn assert_follower_cnt() {
-        const PUBKEY_TARGET: Node = 99;
-        const PUBKEY_FOLLOWER_1: Node = 10;
-        const PUBKEY_FOLLOWER_2: Node = 11;
-        const PUBKEY_FOLLOWER_3: Node = 12;
-
-        let captured = build_dataflow(|events_input| {
+        let captured = build_dataflow(vec![PUBKEY1, 10, 11, 12], |events_input| {
             events_input.insert(EventRow {
-                id: 1,
-                pubkey: PUBKEY_FOLLOWER_1,
-                created_at: 1000,
+                id: 110,
+                pubkey: PUBKEY1,
+                created_at: 1_000,
                 kind: Kind::ContactList.as_u16(),
-                tags: vec![
-                    EventTag::Pubkey(PUBKEY_FOLLOWER_2),
-                    EventTag::Pubkey(PUBKEY_TARGET),
-                    EventTag::Pubkey(PUBKEY_TARGET), // duplicated
+                edges: vec![
+                    Edge::Pubkey(10),
+                    Edge::Pubkey(11),
+                    Edge::Pubkey(12),
+                    Edge::Pubkey(PUBKEY2),
+                    Edge::Pubkey(PUBKEY2),
+                    Edge::Pubkey(3),
                 ],
             });
-
             events_input.insert(EventRow {
-                id: 2,
-                pubkey: PUBKEY_FOLLOWER_2,
-                created_at: 1001,
+                id: 111,
+                pubkey: 10,
+                created_at: 1_100,
                 kind: Kind::ContactList.as_u16(),
-                tags: vec![
-                    EventTag::Pubkey(PUBKEY_FOLLOWER_3),
-                    EventTag::Pubkey(PUBKEY_TARGET),
+                edges: vec![
+                    Edge::Pubkey(PUBKEY1),
+                    Edge::Pubkey(11),
+                    Edge::Pubkey(12),
+                    Edge::Pubkey(PUBKEY2),
                 ],
             });
-
             events_input.insert(EventRow {
-                id: 3,
-                pubkey: PUBKEY_FOLLOWER_3,
-                created_at: 1002,
+                id: 112,
+                pubkey: 11,
+                created_at: 1_200,
                 kind: Kind::ContactList.as_u16(),
-                tags: vec![
-                    EventTag::Pubkey(PUBKEY_FOLLOWER_1),
-                    EventTag::Pubkey(PUBKEY_TARGET),
+                edges: vec![
+                    Edge::Pubkey(PUBKEY1),
+                    Edge::Pubkey(10),
+                    Edge::Pubkey(12),
+                    Edge::Pubkey(PUBKEY2),
                 ],
             });
-
             events_input.insert(EventRow {
-                id: 4,
-                pubkey: PUBKEY_FOLLOWER_1,
-                created_at: 1003,
+                id: 113,
+                pubkey: 12,
+                created_at: 1_300,
                 kind: Kind::ContactList.as_u16(),
-                tags: vec![EventTag::Pubkey(PUBKEY_TARGET)],
+                edges: vec![
+                    Edge::Pubkey(PUBKEY1),
+                    Edge::Pubkey(10),
+                    Edge::Pubkey(11),
+                    Edge::Pubkey(PUBKEY2),
+                ],
             });
         });
 
-        let assertion = get_captured_by_pubkey(&captured, PUBKEY_TARGET)
-            .into_iter()
-            .next()
-            .map(|(_, a, _, _)| a)
-            .unwrap();
+        let followed_1 = latest_assertion_for_pubkey(&captured, PUBKEY2);
+        assert_eq!(followed_1.follower_cnt, 4);
 
-        assert_eq!(assertion.follower_cnt, 3);
+        let followed_2 = latest_assertion_for_pubkey(&captured, 3);
+        assert_eq!(followed_2.follower_cnt, 1);
+    }
+
+    #[test]
+    fn assert_follower_cnt_replacement() {
+        let captured = build_dataflow(vec![PUBKEY1, 6], |events_input| {
+            events_input.insert(EventRow {
+                id: 120,
+                pubkey: PUBKEY1,
+                created_at: 1_000,
+                kind: Kind::ContactList.as_u16(),
+                edges: vec![
+                    Edge::Pubkey(6),
+                    Edge::Pubkey(PUBKEY2),
+                    Edge::Pubkey(3),
+                    Edge::Pubkey(4),
+                ],
+            });
+            events_input.insert(EventRow {
+                id: 122,
+                pubkey: 6,
+                created_at: 1_100,
+                kind: Kind::ContactList.as_u16(),
+                edges: vec![Edge::Pubkey(PUBKEY1)],
+            });
+            events_input.flush();
+
+            events_input.advance_to(2);
+            events_input.remove(EventRow {
+                id: 120,
+                pubkey: PUBKEY1,
+                created_at: 1_000,
+                kind: Kind::ContactList.as_u16(),
+                edges: vec![
+                    Edge::Pubkey(6),
+                    Edge::Pubkey(PUBKEY2),
+                    Edge::Pubkey(3),
+                    Edge::Pubkey(4),
+                ],
+            });
+            events_input.insert(EventRow {
+                id: 121,
+                pubkey: PUBKEY1,
+                created_at: 2_000,
+                kind: Kind::ContactList.as_u16(),
+                edges: vec![
+                    Edge::Pubkey(6),
+                    Edge::Pubkey(PUBKEY2),
+                    Edge::Pubkey(3),
+                    Edge::Pubkey(5),
+                ],
+            });
+        });
+
+        let followed_1 = latest_assertion_for_pubkey(&captured, PUBKEY2);
+        assert_eq!(followed_1.follower_cnt, 1);
+
+        let followed_2 = latest_assertion_for_pubkey(&captured, 3);
+        assert_eq!(followed_2.follower_cnt, 1);
+
+        let followed_3 = latest_assertion_for_pubkey(&captured, 5);
+        assert_eq!(followed_3.follower_cnt, 1);
+
+        let removed = captured
+            .iter()
+            .filter(|(pubkey, _res, _ts, diff)| *pubkey == 4 && *diff > 0)
+            .max_by_key(|(_, _res, ts, _)| *ts);
+        assert!(removed.is_none());
+    }
+
+    #[test]
+    fn assert_post_cnt_and_reply_cnt() {
+        let counted = build_dataflow(vec![], |events_input| {
+            events_input.insert(EventRow {
+                id: 200,
+                pubkey: PUBKEY1,
+                created_at: 1_000,
+                kind: Kind::TextNote.as_u16(),
+                edges: vec![],
+            });
+            events_input.insert(EventRow {
+                id: 201,
+                pubkey: PUBKEY1,
+                created_at: 2_000,
+                kind: Kind::TextNote.as_u16(),
+                edges: vec![Edge::Reply(200)],
+            });
+        });
+
+        let res = latest_assertion_for_pubkey(&counted, PUBKEY1);
+        assert_eq!(res.post_cnt, 1);
+        assert_eq!(res.reply_cnt, 1);
+
+        let retracted = build_dataflow(vec![], |events_input| {
+            events_input.insert(EventRow {
+                id: 200,
+                pubkey: PUBKEY1,
+                created_at: 1_000,
+                kind: Kind::TextNote.as_u16(),
+                edges: vec![],
+            });
+            events_input.insert(EventRow {
+                id: 201,
+                pubkey: PUBKEY1,
+                created_at: 2_000,
+                kind: Kind::TextNote.as_u16(),
+                edges: vec![Edge::Reply(200)],
+            });
+            events_input.flush();
+
+            events_input.advance_to(2);
+            events_input.remove(EventRow {
+                id: 200,
+                pubkey: PUBKEY1,
+                created_at: 1_000,
+                kind: Kind::TextNote.as_u16(),
+                edges: vec![],
+            });
+            events_input.flush();
+        });
+
+        let res = latest_assertion_for_pubkey(&retracted, PUBKEY1);
+        assert_eq!(res.post_cnt, 0);
+        assert_eq!(res.reply_cnt, 1);
+    }
+
+    #[test]
+    fn assert_zaps() {
+        let captured = build_dataflow(vec![], |events_input| {
+            events_input.insert(EventRow {
+                id: 300,
+                pubkey: 9,
+                created_at: 1_000,
+                kind: Kind::ZapReceipt.as_u16(),
+                edges: vec![
+                    Edge::Pubkey(PUBKEY2),
+                    Edge::PubkeyUpper(PUBKEY1),
+                    Edge::Bolt11(1_000),
+                ],
+            });
+        });
+
+        let sender = latest_assertion_for_pubkey(&captured, PUBKEY1);
+        assert_eq!(sender.zap_amt_sent, 1_000);
+        assert_eq!(sender.zap_cnt_sent, 1);
+        assert_eq!(sender.zap_avg_amt_day_sent, 1_000);
+
+        let recipient = latest_assertion_for_pubkey(&captured, PUBKEY2);
+        assert_eq!(recipient.zap_amt_recd, 1_000);
+        assert_eq!(recipient.zap_cnt_recd, 1);
+        assert_eq!(recipient.zap_avg_amt_day_recd, 1_000);
+    }
+
+    #[test]
+    fn assert_reactions_cnt() {
+        let captured = build_dataflow(vec![], |events_input| {
+            events_input.insert(EventRow {
+                id: 400,
+                pubkey: PUBKEY1,
+                created_at: 1_000,
+                kind: Kind::Reaction.as_u16(),
+                edges: vec![Edge::Mention(42)],
+            });
+            events_input.insert(EventRow {
+                id: 401,
+                pubkey: PUBKEY1,
+                created_at: 2_000,
+                kind: Kind::Reaction.as_u16(),
+                edges: vec![Edge::Mention(43)],
+            });
+            events_input.insert(EventRow {
+                id: 402,
+                pubkey: PUBKEY2,
+                created_at: 3_000,
+                kind: Kind::Reaction.as_u16(),
+                edges: vec![Edge::Mention(44)],
+            });
+        });
+
+        let res1 = latest_assertion_for_pubkey(&captured, PUBKEY1);
+        let res2 = latest_assertion_for_pubkey(&captured, PUBKEY2);
+
+        assert_eq!(res1.reactions_cnt, 2);
+        assert_eq!(res2.reactions_cnt, 1);
+    }
+
+    #[test]
+    fn assert_active_hours() {
+        let captured = build_dataflow(vec![], |events_input| {
+            events_input.insert(EventRow {
+                id: 500,
+                pubkey: PUBKEY1,
+                created_at: 2 * 3600,
+                kind: Kind::TextNote.as_u16(),
+                edges: vec![],
+            });
+            events_input.insert(EventRow {
+                id: 501,
+                pubkey: PUBKEY1,
+                created_at: 14 * 3600,
+                kind: Kind::Reaction.as_u16(),
+                edges: vec![Edge::Mention(42)],
+            });
+            events_input.insert(EventRow {
+                id: 502,
+                pubkey: PUBKEY1,
+                created_at: 23 * 3600,
+                kind: Kind::Reporting.as_u16(),
+                edges: vec![Edge::Pubkey(PUBKEY2)],
+            });
+        });
+
+        let res = latest_assertion_for_pubkey(&captured, PUBKEY1);
+        assert_eq!(res.active_hours_start, Some(2));
+        assert_eq!(res.active_hours_end, Some(23));
+        let res2 = latest_assertion_for_pubkey(&captured, PUBKEY2);
+        assert_eq!(res2.active_hours_start, None);
+        assert_eq!(res2.active_hours_end, None);
     }
 }
