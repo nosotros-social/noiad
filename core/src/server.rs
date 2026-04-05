@@ -13,6 +13,7 @@ use transport::{
 pub struct Handler {
     pub req_txs: Arc<Vec<Sender<Request>>>,
     pub resp_rx: mpsc::UnboundedReceiver<Response>,
+    request_limits: HashMap<ReqId, Option<usize>>,
     recv_task: tokio::task::JoinHandle<()>,
 }
 
@@ -75,6 +76,7 @@ impl Handler {
         Self {
             req_txs,
             resp_rx,
+            request_limits: HashMap::new(),
             recv_task,
         }
     }
@@ -111,6 +113,9 @@ impl Handler {
 #[async_trait]
 impl ConnectionHandler for Handler {
     async fn send(&mut self, request: &Request) -> Result<()> {
+        self.request_limits
+            .insert(request.request_id, request.filter.limit);
+
         // Broadcast request to all workers
         for tx in self.req_txs.iter() {
             tx.send(request.clone())?;
@@ -119,10 +124,24 @@ impl ConnectionHandler for Handler {
     }
 
     async fn recv(&mut self) -> Result<Response> {
-        self.resp_rx
+        let mut response = self
+            .resp_rx
             .recv()
             .await
-            .ok_or_else(|| anyhow::anyhow!("channel closed"))
+            .ok_or_else(|| anyhow::anyhow!("channel closed"))?;
+
+        match &mut response {
+            Response::Result { request_id, events } => {
+                if let Some(Some(limit)) = self.request_limits.get(request_id) {
+                    events.truncate(*limit);
+                }
+            }
+            Response::Eose { request_id } => {
+                self.request_limits.remove(request_id);
+            }
+        }
+
+        Ok(response)
     }
 }
 
@@ -254,5 +273,60 @@ mod tests {
 
         assert_recv_request(&mut handler, req_id_2, vec![event3.clone(), event3.clone()]).await;
         assert_recv_request(&mut handler, req_id_1, vec![event1.clone(), event2.clone()]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn assert_server_respects_global_limit_after_merge() {
+        let (mut handler, workers) = make_handler(3);
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let request_id = 7;
+        handler
+            .send(&Request {
+                request_id,
+                filter: nostr_sdk::Filter::new()
+                    .kind(nostr_sdk::Kind::TextNote)
+                    .author(pubkey)
+                    .limit(1),
+            })
+            .await
+            .unwrap();
+
+        for w in workers.iter() {
+            assert_eq!(w.recv_request().request_id, request_id);
+        }
+
+        let event1 = make_test_event(keys.clone());
+        let event2 = make_test_event(keys.clone());
+        let event3 = make_test_event(keys.clone());
+
+        workers[0].send_results(request_id, vec![event1.clone()]);
+        workers[0].send_eose(request_id);
+        workers[1].send_results(request_id, vec![event2.clone()]);
+        workers[1].send_eose(request_id);
+        workers[2].send_results(request_id, vec![event3.clone()]);
+        workers[2].send_eose(request_id);
+
+        match handler.recv().await.unwrap() {
+            Response::Result {
+                request_id: got_id,
+                events,
+            } => {
+                assert_eq!(got_id, request_id);
+                assert_eq!(events.len(), 1);
+                assert!(
+                    events.contains(&event1)
+                        || events.contains(&event2)
+                        || events.contains(&event3)
+                );
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+
+        match handler.recv().await.unwrap() {
+            Response::Eose { request_id: got_id } => assert_eq!(got_id, request_id),
+            other => panic!("expected Eose, got {other:?}"),
+        }
     }
 }
