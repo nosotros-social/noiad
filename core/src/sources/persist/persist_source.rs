@@ -1,34 +1,27 @@
-use std::time::Duration;
-
 use anyhow::Error;
 use differential_dataflow::{AsCollection, Data, VecCollection};
 use futures::StreamExt;
-use persist::event::EventRecord;
-use persist::iter::PersistQueryIter;
+use persist::query::PersistQuery;
 use timely::Container;
 use timely::container::CapacityContainerBuilder;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::{Scope, StreamCore};
-use tokio::sync::broadcast::error::{RecvError, TryRecvError};
-use tokio::time::interval;
-use types::event::EventRow;
-use types::types::Diff;
+use types::{event::EventRow, types::Diff};
 
 use crate::dataflow::DataflowConfig;
 use crate::operators::builder_async::{AsyncOperatorBuilder, Event};
 use crate::operators::probe::Handle;
 
-pub fn persist_source<G, D, Q>(
+pub fn persist_source<G, D>(
     scope: &G,
     config: DataflowConfig,
-    query: Q,
+    query: PersistQuery,
     start_stream: &StreamCore<G, D>,
     probe: &Handle<u64>,
-) -> VecCollection<G, EventRow, Diff>
+) -> (VecCollection<G, EventRow, Diff>, StreamCore<G, Vec<u64>>)
 where
     G: Scope<Timestamp = u64>,
     D: Container + Data,
-    Q: PersistQueryIter + Clone + 'static,
 {
     let mut builder = AsyncOperatorBuilder::new("PersistSource".to_string(), scope.clone());
 
@@ -36,16 +29,16 @@ where
 
     let (event_handle, event_stream) =
         builder.new_output::<CapacityContainerBuilder<Vec<(EventRow, u64, Diff)>>>();
+    let (bootstrap_handle, bootstrap_stream) =
+        builder.new_output::<CapacityContainerBuilder<Vec<u64>>>();
 
     let probe = probe.clone();
     let worker_id = scope.index();
-
+    let workers = scope.peers();
+    let batch_size = 10_000_000;
     let _ = builder.build_fallible(move |capabilities| {
         Box::pin(async move {
-            if worker_id != 0 {
-                return Ok(());
-            }
-            let [event_cap]: &mut [_; 1] = capabilities.try_into().unwrap();
+            let [event_cap, bootstrap_cap]: &mut [_; 2] = capabilities.try_into().unwrap();
 
             while let Some(event) = signal_input.next().await {
                 if let Event::Progress(frontier) = event
@@ -55,13 +48,22 @@ where
                 }
             }
 
+            let mut subscription = config.persist.subscribe(worker_id, workers);
+
             let mut counter = 0usize;
+            let mut ts = 0u64;
             let started_at = std::time::Instant::now();
-            for event in query.clone().iter(&config.persist) {
+            for event in config
+                .persist
+                .iter_events_for_worker(query.clone(), worker_id, workers)
+            {
                 counter += 1;
-                let ts = 0;
                 let diff = 1;
                 event_handle.give(&event_cap[0], (event, ts, diff));
+                if counter.is_multiple_of(batch_size) {
+                    ts += 1;
+                    event_cap.downgrade([ts]);
+                }
                 if counter.is_multiple_of(5000) {
                     tokio::task::yield_now().await;
                 }
@@ -73,46 +75,42 @@ where
                 started_at.elapsed()
             );
 
-            event_cap.downgrade([1]);
+            let bootstrap_frontier = ts + 1;
+            event_cap.downgrade([bootstrap_frontier]);
+            bootstrap_handle.give(&bootstrap_cap[0], bootstrap_frontier);
+            bootstrap_cap.downgrade(std::iter::empty::<u64>());
 
-            let mut subscription = config.persist.subscribe();
-            let mut next_ts = 1u64;
+            let mut max_seen_ts = 0u64;
 
-            loop {
-                match subscription.recv().await {
-                    Ok((event, ts, diff)) => {
-                        let event = EventRow {
+            while let Some((event, ts, diff)) = subscription.recv().await {
+                if !query.matches_kind(event.kind) {
+                    continue;
+                }
+
+                max_seen_ts = max_seen_ts.max(ts);
+                let d = diff as Diff;
+                event_handle.give(
+                    &event_cap[0],
+                    (
+                        EventRow {
                             id: event.id,
                             pubkey: event.pubkey,
                             kind: event.kind,
                             created_at: event.created_at,
-                            tags: event.tags,
-                        };
-                        if !query.matches(&event) {
-                            continue;
-                        }
+                            edges: event.tags,
+                        },
+                        ts,
+                        d,
+                    ),
+                );
 
-                        next_ts = next_ts.max(ts);
-                        event_handle.give(&event_cap[0], (event, next_ts, diff as Diff));
+                if subscription.is_empty() {
+                    let closed_through = max_seen_ts;
+                    let new_frontier = closed_through.saturating_add(1);
+                    event_cap.downgrade([new_frontier]);
 
-                        if subscription.is_empty() {
-                            tracing::info!(
-                                "[Worker {}] persist_source advancing frontier to {}",
-                                worker_id,
-                                next_ts + 1
-                            );
-                            event_cap.downgrade([next_ts]);
-
-                            while probe.with_frontier(|f| f.less_equal(&(next_ts - 1))) {
-                                probe.progressed().await;
-                            }
-                        }
-                    }
-                    Err(RecvError::Lagged(n)) => {
-                        tracing::warn!("persist_source lagged {} messages", n);
-                    }
-                    Err(RecvError::Closed) => {
-                        break;
+                    while probe.with_frontier(|f| f.less_equal(&closed_through)) {
+                        probe.progressed().await;
                     }
                 }
             }
@@ -121,5 +119,5 @@ where
         })
     });
 
-    event_stream.as_collection()
+    (event_stream.as_collection(), bootstrap_stream)
 }

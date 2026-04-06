@@ -1,7 +1,9 @@
 use anyhow::Result;
 use rocksdb::{ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options};
+use std::collections::HashMap;
 use std::path::Path;
-use tokio::sync::broadcast;
+use std::sync::Mutex;
+use tokio::sync::mpsc;
 use types::types::Diff;
 
 use crate::{
@@ -14,6 +16,7 @@ pub type PersistInputUpdate = (EventRaw, u64, Diff);
 pub type PersistUpdate = (EventRecord, u64, Diff);
 pub const NUM_EVENT_SHARDS: usize = 64;
 type RocksDb = DBWithThreadMode<MultiThreaded>;
+type WorkerKey = (usize, usize);
 
 const CHECKPOINT_KEY: &[u8] = b"checkpoint";
 
@@ -22,7 +25,7 @@ pub struct PersistStore {
     pub event_shards: Vec<RocksDb>,
     pub db: RocksDb,
     pub interner: Interner,
-    updates_tx: broadcast::Sender<PersistUpdate>,
+    subscribers: Mutex<HashMap<WorkerKey, mpsc::UnboundedSender<PersistUpdate>>>,
 }
 
 fn db_options() -> Options {
@@ -77,13 +80,11 @@ impl PersistStore {
             })
             .collect::<Result<Vec<_>>>()?;
         let interner = Interner::new(&db)?;
-        let (updates_tx, _) = broadcast::channel(100_000);
-
         Ok(PersistStore {
             event_shards,
             db,
             interner,
-            updates_tx,
+            subscribers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -109,18 +110,37 @@ impl PersistStore {
                 .as_ref()
                 .try_into()
                 .expect("checkpoint must be 8 bytes");
-            Ok(Some(u64::from_be_bytes(bytes)))
+            let checkpoint = u64::from_be_bytes(bytes);
+            Ok(Some(checkpoint))
         } else {
             Ok(None)
         }
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<PersistUpdate> {
-        self.updates_tx.subscribe()
+    pub fn subscribe(
+        &self,
+        worker_id: usize,
+        workers: usize,
+    ) -> mpsc::UnboundedReceiver<PersistUpdate> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.subscribers
+            .lock()
+            .unwrap()
+            .insert((worker_id, workers), tx);
+        rx
     }
 
     pub fn notify(&self, event: EventRecord, ts: u64, diff: Diff) {
-        let _ = self.updates_tx.send((event, ts, diff));
+        self.subscribers
+            .lock()
+            .unwrap()
+            .retain(|(worker_id, workers), tx| {
+                if self.shard_for_event_id(event.id) % *workers != *worker_id {
+                    return true;
+                }
+
+                tx.send((event.clone(), ts, diff)).is_ok()
+            });
     }
 }
 
