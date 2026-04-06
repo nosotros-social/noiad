@@ -160,8 +160,16 @@ impl PersistStore {
         let id = self.interner.intern_batch(batch, &raw.id)?;
         let pubkey = self.interner.intern_batch(batch, &raw.pubkey)?;
 
-        let parsed_tags: Vec<Vec<&str>> =
-            serde_json::from_slice(&raw.tags_json).unwrap_or_default();
+        let parsed_tags: Vec<Vec<String>> = match serde_json::from_slice(&raw.tags_json) {
+            Ok(tags) => tags,
+            Err(err) => {
+                tracing::warn!(
+                    event_id = %hex::encode(raw.id),
+                    "failed to parse event tags JSON: {err}"
+                );
+                Vec::new()
+            }
+        };
 
         let tags = self.parse_and_intern_tags(batch, &parsed_tags)?;
         let event = EventRecord {
@@ -310,19 +318,19 @@ impl PersistStore {
     fn parse_and_intern_tags(
         &self,
         batch: &mut InternBatch,
-        tags: &[Vec<&str>],
+        tags: &[Vec<String>],
     ) -> Result<Vec<Edge>> {
         tags.iter()
             .filter_map(|tag| {
-                let tag_name = *tag.first()?;
-                let value = *tag.get(1)?;
+                let tag_name = tag.first()?.as_str();
+                let value = tag.get(1)?.as_str();
                 let edge_result: Result<Edge> = match tag_name {
                     "e" => {
                         let id_bytes = decode_hex32(value.as_bytes())?;
                         self.interner
                             .intern_batch(batch, &id_bytes)
                             .map(|interned| {
-                                let marker = tag.get(3).copied();
+                                let marker = tag.get(3).map(String::as_str);
                                 match marker {
                                     Some("reply") => Edge::Reply(interned),
                                     Some("root") => Edge::RootReply(interned),
@@ -633,6 +641,43 @@ mod tests {
     }
 
     #[test]
+    fn assert_zap_receipt_tags_store_sender_recipient_and_amount() {
+        let store = TestStore::default();
+
+        let recipient =
+            hex::decode("fd4169cc72134e14cb4da85a58cb7c1fbc2964c943833fc04bbd2de8f747990c")
+                .unwrap();
+        let sender =
+            hex::decode("c6603b0f1ccfec625d9c08b753e4f774eaf7d1cf2769223125b5fd4da728019e")
+                .unwrap();
+        let invoice = "lnbc210n1p5taldgpp5mt438wrurccqyfr2wezvxltvq65uva52vu353pejh5hk5nafz7nqhp5ahv2jk6q8w7en4p9fyec3a95pw2pfkrgsxxu7x5l3xmet20zkreqcqzpuxqrwzqsp5svx5nt0y4485g74muzr27jf8nqlrjfetnt8ufq3u3yerqsy2dxjs9qxpqysgqm7lykvrlkkdktnylz8axr4fdal5j6u4qtv2xe26f06qzvzsxvak30q8prqxt9dwxccd33e3ezur5rcp8ua3nlrqwjlcw3s4u4se22tqq8pdgyv";
+        let description = r#"{"kind":9734,"pubkey":"c6603b0f1ccfec625d9c08b753e4f774eaf7d1cf2769223125b5fd4da728019e","content":"","tags":[["p","fd4169cc72134e14cb4da85a58cb7c1fbc2964c943833fc04bbd2de8f747990c"]]}"#;
+
+        let raw = event_raw! (
+            id: [10u8; 32],
+            pubkey: [11u8; 32],
+            kind: 9735,
+            tags_json: serde_json::json!([
+                ["p", hex::encode(&recipient)],
+                ["P", hex::encode(&sender)],
+                ["bolt11", invoice.to_string()],
+                ["description", description.to_string()]
+            ])
+            .to_string()
+            .into_bytes(),
+        );
+
+        let event = store.insert_event(&raw).unwrap().unwrap();
+        let stored = store.get_event(event.id).unwrap().unwrap();
+        let recipient_node = store.interner.intern(&store.db, &recipient).unwrap();
+        let sender_node = store.interner.intern(&store.db, &sender).unwrap();
+
+        assert!(stored.tags.contains(&Edge::Pubkey(recipient_node)));
+        assert!(stored.tags.contains(&Edge::PubkeyUpper(sender_node)));
+        assert!(stored.tags.contains(&Edge::Bolt11(21)));
+    }
+
+    #[test]
     fn assert_invalid_bolt11_is_ignored() {
         let store = TestStore::default();
 
@@ -758,7 +803,7 @@ mod tests {
     #[test]
     fn assert_notifications() {
         let store = TestStore::default();
-        let mut sub = store.subscribe();
+        let mut sub = store.subscribe(0, 1);
 
         let pubkey = [1u8; 32];
         let old_event = event_raw!(
