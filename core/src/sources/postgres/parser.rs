@@ -26,7 +26,7 @@ fn parse_copy_row(row: &[u8], delimiter: u8) -> Option<EventRaw> {
 
     let id_hex = cols.next()?;
     let pubkey_hex = cols.next()?;
-    let created_at = atoi::atoi::<u64>(cols.next()?)?;
+    let created_at = atoi::atoi::<u32>(cols.next()?)?;
     let kind = atoi::atoi::<u16>(cols.next()?)?;
     let tags_input = cols.next()?;
     let content_input = cols.next()?;

@@ -17,7 +17,6 @@ use postgres_replication::LogicalReplicationStream;
 use postgres_replication::protocol::{LogicalReplicationMessage, ReplicationMessage, TupleData};
 use tokio_postgres::types::PgLsn;
 
-use crate::dataflow::DataflowConfig;
 use crate::operators::builder_async::{AsyncOperatorBuilder, Event};
 use crate::sources::postgres::connection::PostgresConnection;
 
@@ -27,11 +26,7 @@ const MINUS_ONE: Diff = -1;
 static PG_EPOCH: LazyLock<SystemTime> =
     LazyLock::new(|| UNIX_EPOCH + Duration::from_secs(946_684_800));
 
-pub fn replication<G>(
-    scope: &G,
-    config: DataflowConfig,
-    lsn_stream: &Stream<G, u64>,
-) -> VecCollection<G, EventRaw, Diff>
+pub fn replication<G>(scope: &G, lsn_stream: &Stream<G, u64>) -> VecCollection<G, EventRaw, Diff>
 where
     G: Scope<Timestamp = u64>,
 {
@@ -157,7 +152,7 @@ where
                                 }
                             }
 
-                            Ok(ReplicationMessage::PrimaryKeepAlive(keepalive)) => {}
+                            Ok(ReplicationMessage::PrimaryKeepAlive(_keepalive)) => {}
 
                             Err(err) => {
                                 tracing::error!("PgReplication error: {:?}", err);
@@ -180,14 +175,6 @@ where
     raw_stream.as_collection()
 }
 
-fn parse_u64(bytes: &[u8]) -> Option<u64> {
-    atoi::atoi(bytes)
-}
-
-fn parse_u16(bytes: &[u8]) -> Option<u16> {
-    atoi::atoi(bytes)
-}
-
 fn tuple_bytes(data: &TupleData) -> Option<&[u8]> {
     match data {
         TupleData::Text(bytes) => Some(bytes),
@@ -199,8 +186,8 @@ fn tuple_bytes(data: &TupleData) -> Option<&[u8]> {
 fn parse_event_raw(tuple: &[TupleData]) -> Option<EventRaw> {
     let id = parse_hex_32(tuple_bytes(tuple.first()?)?)?;
     let pubkey = parse_hex_32(tuple_bytes(tuple.get(1)?)?)?;
-    let created_at = parse_u64(tuple_bytes(tuple.get(2)?)?)?;
-    let kind = parse_u16(tuple_bytes(tuple.get(3)?)?)?;
+    let created_at = atoi::atoi::<u32>(tuple_bytes(tuple.get(2)?)?)?;
+    let kind = atoi::atoi::<u16>(tuple_bytes(tuple.get(3)?)?)?;
     let tags_json = match tuple.get(4)? {
         TupleData::Text(bytes) => bytes.to_vec(),
         TupleData::Null => b"[]".to_vec(),

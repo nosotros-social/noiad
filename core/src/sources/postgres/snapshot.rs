@@ -11,6 +11,7 @@ use timely::dataflow::operators::Operator;
 use timely::{container::CapacityContainerBuilder, dataflow::Scope};
 use tokio_postgres::SimpleQueryMessage;
 use tokio_postgres::types::PgLsn;
+use types::types::Diff;
 
 use crate::dataflow::DataflowConfig;
 use crate::operators::builder_async::AsyncOperatorBuilder;
@@ -21,7 +22,7 @@ use crate::sources::postgres::utils::get_publication_info;
 pub fn snapshot<G>(
     scope: &G,
     config: DataflowConfig,
-) -> (VecCollection<G, EventRaw>, Stream<G, u64>)
+) -> (VecCollection<G, EventRaw, Diff>, Stream<G, u64>)
 where
     G: Scope<Timestamp = u64>,
 {
