@@ -618,9 +618,11 @@ mod tests {
             pagerank_iterations: 20,
             pagerank_sink_batch_size: 0,
             replication_max_pending: 0,
+            no_replication: false,
             trusted_assertions_nsec: None,
             embedding_import_manifest: None,
             dataset_sink_path: None,
+            recompute: false,
             trusted_seeds,
             trusted_lists_ranks_k: 0,
         }

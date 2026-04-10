@@ -160,7 +160,7 @@ where
 
 impl IntoNostrEvent for TrustedUser {
     fn into_nostr_event(self, identifier: String, keys: &Keys) -> Result<Event> {
-        let mut tags = vec![Tag::identifier(&identifier)];
+        let mut tags = vec![Tag::identifier(&identifier), Tag::public_key(identifier.parse()?)];
         push_nonzero_tag(&mut tags, "follower_cnt", self.follower_cnt);
         push_nonzero_tag(&mut tags, "post_cnt", self.post_cnt);
         push_nonzero_tag(&mut tags, "reply_cnt", self.reply_cnt);
@@ -198,6 +198,7 @@ impl IntoNostrEvent for TrustedUser {
         }
 
         let event = EventBuilder::new(Kind::Custom(30382), "")
+            .allow_self_tagging()
             .tags(tags)
             .sign_with_keys(keys)?;
 

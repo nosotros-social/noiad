@@ -31,7 +31,7 @@ impl IntoNostrEvent for TrustedListRanks {
         tags.push(Tag::custom(TagKind::custom("metric"), ["rank"]));
 
         for (pubkey_node, rank) in self.pubkeys_by_rank {
-            let Some(pubkey_bytes) = persist.interner.resolve(&persist.db, pubkey_node)? else {
+            let Some(pubkey_bytes) = persist.resolve_node(pubkey_node)? else {
                 tracing::warn!("Could not resolve pubkey node {pubkey_node} to bytes");
                 continue;
             };
@@ -97,7 +97,7 @@ impl IntoNostrEvent for TrustedListFollowers {
         tags.push(Tag::custom(TagKind::custom("metric"), ["follower_cnt"]));
 
         for (pubkey_node, follower_cnt) in self.pubkeys_by_followers {
-            let Some(pubkey_bytes) = persist.interner.resolve(&persist.db, pubkey_node)? else {
+            let Some(pubkey_bytes) = persist.resolve_node(pubkey_node)? else {
                 tracing::warn!("Could not resolve pubkey node {pubkey_node} to bytes");
                 continue;
             };
@@ -175,11 +175,11 @@ mod tests {
                 trusted_list_ranks(&assertions, 3).inner.capture_into(tx);
             });
 
-            input.insert((1, assertion_with_rank(50)));
-            input.insert((2, assertion_with_rank(20)));
-            input.insert((3, assertion_with_rank(15)));
-            input.insert((4, assertion_with_rank(30)));
-            input.insert((5, assertion_with_rank(25)));
+            input.update((1, assertion_with_rank(50)), 1 as Diff);
+            input.update((2, assertion_with_rank(20)), 1 as Diff);
+            input.update((3, assertion_with_rank(15)), 1 as Diff);
+            input.update((4, assertion_with_rank(30)), 1 as Diff);
+            input.update((5, assertion_with_rank(25)), 1 as Diff);
 
             input.advance_to(1);
             input.flush();

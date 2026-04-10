@@ -6,4 +6,7 @@ db
 *.pdb
 .env
 .sqlx/
+models/
 data/
+old/
+binold/

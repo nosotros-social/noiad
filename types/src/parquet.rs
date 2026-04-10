@@ -2,7 +2,9 @@ use crate::{
     trusted_assertions::ta_user::TrustedUser,
     types::{Diff, Node},
 };
-use arrow_array::{ArrayRef, Int32Array, Int64Array, UInt8Array, UInt32Array, UInt64Array};
+use arrow_array::{
+    ArrayRef, Int32Array, Int64Array, StringArray, UInt8Array, UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use std::{
     collections::{HashMap, HashSet},
@@ -120,6 +122,54 @@ impl SnapshotSink for FeaturesParquet {
         if diff > 0 {
             self.0.insert(node, assertion);
         } else if diff < 0 && self.0.get(&node) == Some(&assertion) {
+            self.0.remove(&node);
+        }
+    }
+
+    fn rows(&self) -> usize {
+        self.0.len()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NodesParquet(pub HashMap<Node, String>);
+
+impl ToParquet for NodesParquet {
+    fn as_parquet(&self) -> (Arc<Schema>, Vec<ArrayRef>) {
+        let mut rows: Vec<_> = self.0.iter().collect();
+        rows.sort_unstable_by_key(|(node, _)| *node);
+
+        let mut node_ids = Vec::with_capacity(rows.len());
+        let mut node_pubkeys = Vec::with_capacity(rows.len());
+
+        for (node, pubkey) in rows {
+            node_ids.push(*node);
+            node_pubkeys.push(pubkey.clone());
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("node_id", DataType::UInt32, false),
+            Field::new("node_pubkey", DataType::Utf8, false),
+        ]));
+
+        let columns = vec![
+            Arc::new(UInt32Array::from(node_ids)) as ArrayRef,
+            Arc::new(StringArray::from(node_pubkeys)) as ArrayRef,
+        ];
+
+        (schema, columns)
+    }
+}
+
+impl SnapshotSink for NodesParquet {
+    type Item = (Node, String);
+
+    fn apply_diff(&mut self, item: Self::Item, diff: Diff) {
+        let (node, pubkey) = item;
+
+        if diff > 0 {
+            self.0.insert(node, pubkey);
+        } else if diff < 0 && self.0.get(&node) == Some(&pubkey) {
             self.0.remove(&node);
         }
     }

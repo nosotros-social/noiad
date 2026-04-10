@@ -9,6 +9,7 @@ nostr-database = "0.43.0"
 nostr-relay-builder = { version = '0.43.0' }
 nostr-sdk = { version = '0.43.0' }
 nostrpg = { path = "../nostrpg" }
+search = { path = "../search" }
 tokio = { version = "1.46.1", features = ["signal"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"

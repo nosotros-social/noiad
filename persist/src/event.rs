@@ -5,11 +5,11 @@ use rkyv::{Archive, from_bytes, to_bytes};
 use rkyv::{Deserialize, Serialize, rancor};
 use rocksdb::WriteBatch;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use types::edges::Edge;
 
-use crate::db::{PersistInputUpdate, PersistStore, PersistUpdate};
+use crate::db::{PersistInputUpdate, PersistStore, PersistUpdate, event_record_key};
 use crate::interner::InternBatch;
 use crate::schema::{ADDRESSABLE_CF, EVENT_RAW_CF, EVENTS_CF, REPLACEABLE_CF, cf};
 
@@ -41,7 +41,11 @@ pub struct EventRawRecord {
 }
 
 impl EventRecord {
-    pub fn key(&self) -> [u8; 4] {
+    pub fn key(&self) -> [u8; 5] {
+        event_record_key(self.id)
+    }
+
+    pub fn raw_key(&self) -> [u8; 4] {
         self.id.to_be_bytes()
     }
 
@@ -109,10 +113,9 @@ impl EventRecord {
 
 impl PersistStore {
     pub fn get_event(&self, id: u32) -> Result<Option<EventRecord>> {
-        let event_db = self.event_db(id);
-        let cf_events = cf!(event_db, EVENTS_CF);
-        event_db
-            .get_cf(&cf_events, id.to_be_bytes())?
+        let cf_events = cf!(self.db, EVENTS_CF);
+        self.db
+            .get_cf(&cf_events, event_record_key(id))?
             .map(|bytes| {
                 from_bytes::<EventRecord, rancor::Error>(&bytes).map_err(anyhow::Error::from)
             })
@@ -130,27 +133,40 @@ impl PersistStore {
     }
 
     pub fn insert_event(&self, raw: &EventRaw) -> Result<Option<EventRecord>> {
-        let mut batch = InternBatch::new(&self.db, &self.interner);
-        let mut shard_batches: HashMap<usize, WriteBatch> = HashMap::new();
-        let result = self.insert_event_internal(&mut batch, &mut shard_batches, raw)?;
-        self.db.write(std::mem::take(&mut batch.write_batch))?;
-        for (shard_id, shard_batch) in shard_batches {
-            self.event_shards[shard_id].write(shard_batch)?;
-        }
+        let _guard = self.event_write_lock.lock().unwrap();
+        let mut intern_batch = InternBatch::new(&self.interner_db, &self.interner);
+        let mut event_batch = WriteBatch::default();
+        let mut pending_ids = HashSet::new();
+        let mut pending_replaceable = HashMap::new();
+        let mut pending_addressable = HashMap::new();
+        let result = self.insert_event_internal(
+            &mut intern_batch,
+            &mut event_batch,
+            &mut pending_ids,
+            &mut pending_replaceable,
+            &mut pending_addressable,
+            raw,
+        )?;
+        self.interner_db
+            .write(std::mem::take(&mut intern_batch.write_batch))?;
+        self.db.write(event_batch)?;
         Ok(result.map(|(event, _)| event))
     }
 
     fn insert_event_internal(
         &self,
         batch: &mut InternBatch,
-        shard_batches: &mut HashMap<usize, WriteBatch>,
+        event_batch: &mut WriteBatch,
+        pending_ids: &mut HashSet<u32>,
+        pending_replaceable: &mut HashMap<[u8; 6], EventRecord>,
+        pending_addressable: &mut HashMap<[u8; 10], EventRecord>,
         raw: &EventRaw,
     ) -> Result<Option<(EventRecord, Option<EventRecord>)>> {
-        if let Some(existing_id) = self.interner.get(&self.db, &raw.id)? {
-            let event_db = self.event_db(existing_id);
-            let cf_events = cf!(event_db, EVENTS_CF);
-            if event_db
-                .get_cf(&cf_events, existing_id.to_be_bytes())?
+        if let Some(existing_id) = self.intern_get(&raw.id)? {
+            let cf_events = cf!(self.db, EVENTS_CF);
+            if self
+                .db
+                .get_cf(&cf_events, event_record_key(existing_id))?
                 .is_some()
             {
                 return Ok(None);
@@ -158,6 +174,10 @@ impl PersistStore {
         }
 
         let id = self.interner.intern_batch(batch, &raw.id)?;
+        if !pending_ids.insert(id) {
+            return Ok(None);
+        }
+
         let pubkey = self.interner.intern_batch(batch, &raw.pubkey)?;
 
         let parsed_tags: Vec<Vec<String>> = match serde_json::from_slice(&raw.tags_json) {
@@ -188,131 +208,145 @@ impl PersistStore {
         let mut deleted_event: Option<EventRecord> = None;
 
         if event.is_replaceable() {
-            if let Some(old_event) = self.find_replaceable(&event)? {
+            let key = event.replaceable_key();
+            let old_event = if let Some(pending) = pending_replaceable.get(&key) {
+                Some(pending.clone())
+            } else {
+                self.find_replaceable(&event)?
+            };
+
+            if let Some(old_event) = old_event {
                 if old_event.created_at >= event.created_at {
                     return Ok(None);
                 }
-                self.delete_event(batch, shard_batches, &old_event);
+                self.delete_event(event_batch, &old_event);
                 deleted_event = Some(old_event);
             }
             let cf_replaceable = cf!(self.db, REPLACEABLE_CF);
-            batch.write_batch.put_cf(
-                &cf_replaceable,
-                event.replaceable_key(),
-                event.id.to_be_bytes(),
-            );
+            event_batch.put_cf(&cf_replaceable, key, event.raw_key());
+            pending_replaceable.insert(key, event.clone());
         }
 
         if event.is_addressable() {
-            if let Some(old_event) = self.find_addressable(&event)? {
-                if old_event.created_at >= event.created_at {
-                    return Ok(None);
-                }
-                self.delete_event(batch, shard_batches, &old_event);
-                deleted_event = Some(old_event);
-            }
             if let Some(key) = event.addressable_key() {
+                let old_event = if let Some(pending) = pending_addressable.get(&key) {
+                    Some(pending.clone())
+                } else {
+                    self.find_addressable(&event)?
+                };
+
+                if let Some(old_event) = old_event {
+                    if old_event.created_at >= event.created_at {
+                        return Ok(None);
+                    }
+                    self.delete_event(event_batch, &old_event);
+                    deleted_event = Some(old_event);
+                }
                 let cf_addressable = cf!(self.db, ADDRESSABLE_CF);
-                batch
-                    .write_batch
-                    .put_cf(&cf_addressable, key, event.id.to_be_bytes());
+                event_batch.put_cf(&cf_addressable, key, event.raw_key());
+                pending_addressable.insert(key, event.clone());
             }
         }
 
         let event_value = to_bytes::<rancor::Error>(&event)?;
         let raw_event_value = to_bytes::<rancor::Error>(&raw_event)?;
-        let shard_id = self.shard_for_event_id(event.id);
-        let event_db = &self.event_shards[shard_id];
-        let cf_events = cf!(event_db, EVENTS_CF);
-        shard_batches.entry(shard_id).or_default().put_cf(
-            &cf_events,
-            event.key(),
-            event_value.as_ref(),
-        );
+        let cf_events = cf!(self.db, EVENTS_CF);
+        event_batch.put_cf(&cf_events, event.key(), event_value.as_ref());
         let cf_event_raw = cf!(self.db, EVENT_RAW_CF);
-        batch
-            .write_batch
-            .put_cf(&cf_event_raw, event.key(), raw_event_value.as_ref());
+        event_batch.put_cf(&cf_event_raw, event.raw_key(), raw_event_value.as_ref());
 
         Ok(Some((event, deleted_event)))
     }
 
-    fn delete_event(
-        &self,
-        batch: &mut InternBatch,
-        shard_batches: &mut HashMap<usize, WriteBatch>,
-        event: &EventRecord,
-    ) {
-        let shard_id = self.shard_for_event_id(event.id);
-        let event_db = &self.event_shards[shard_id];
-        let cf_events = cf!(event_db, EVENTS_CF);
-        shard_batches
-            .entry(shard_id)
-            .or_default()
-            .delete_cf(&cf_events, event.key());
+    fn delete_event(&self, event_batch: &mut WriteBatch, event: &EventRecord) {
+        let cf_events = cf!(self.db, EVENTS_CF);
+        event_batch.delete_cf(&cf_events, event.key());
         let cf_event_raw = cf!(self.db, EVENT_RAW_CF);
-        batch.write_batch.delete_cf(&cf_event_raw, event.key());
+        event_batch.delete_cf(&cf_event_raw, event.raw_key());
 
         if event.is_replaceable() {
             let cf_replaceable = cf!(self.db, REPLACEABLE_CF);
-            batch
-                .write_batch
-                .delete_cf(&cf_replaceable, event.replaceable_key());
+            event_batch.delete_cf(&cf_replaceable, event.replaceable_key());
         }
         if event.is_addressable()
             && let Some(key) = event.addressable_key()
         {
             let cf_addressable = cf!(self.db, ADDRESSABLE_CF);
-            batch.write_batch.delete_cf(&cf_addressable, key);
+            event_batch.delete_cf(&cf_addressable, key);
         }
     }
 
     pub fn apply_updates(&self, inputs: &[PersistInputUpdate]) -> Result<()> {
-        if inputs.is_empty() {
-            return Ok(());
+        let (new_upper, notifications) = self.write_events(inputs)?;
+
+        if let Some(new_upper) = new_upper {
+            self.save_checkpoint(new_upper)?;
         }
 
-        let mut max_ts: u64 = 0;
-        let mut batch = InternBatch::new(&self.db, &self.interner);
-        let mut shard_batches: HashMap<usize, WriteBatch> = HashMap::new();
+        self.notify_all(notifications);
+        Ok(())
+    }
+
+    pub fn apply_generated_updates(&self, inputs: &[PersistInputUpdate]) -> Result<()> {
+        let _guard = self.event_write_lock.lock().unwrap();
+        let (_, notifications) = self.write_events(inputs)?;
+        self.notify_all(notifications);
+        Ok(())
+    }
+
+    fn write_events(
+        &self,
+        inputs: &[PersistInputUpdate],
+    ) -> Result<(Option<u64>, Vec<PersistUpdate>)> {
+        if inputs.is_empty() {
+            return Ok((None, Vec::new()));
+        }
+
+        let mut max_ts: Option<u64> = None;
+        let mut intern_batch = InternBatch::new(&self.interner_db, &self.interner);
+        let mut event_batch = WriteBatch::default();
         let mut notifications: Vec<PersistUpdate> = Vec::with_capacity(inputs.len());
+        let mut pending_ids = HashSet::new();
+        let mut pending_replaceable = HashMap::new();
+        let mut pending_addressable = HashMap::new();
 
         for (event, ts, diff) in inputs {
-            if *ts > max_ts {
-                max_ts = *ts;
-            }
+            max_ts = Some(max_ts.map_or(*ts, |max| max.max(*ts)));
 
             if *diff > 0 {
-                if let Some((event, deleted)) =
-                    self.insert_event_internal(&mut batch, &mut shard_batches, event)?
-                {
+                if let Some((event, deleted)) = self.insert_event_internal(
+                    &mut intern_batch,
+                    &mut event_batch,
+                    &mut pending_ids,
+                    &mut pending_replaceable,
+                    &mut pending_addressable,
+                    event,
+                )? {
                     if let Some(old_event) = deleted {
                         notifications.push((old_event, *ts, -1));
                     }
                     notifications.push((event, *ts, 1));
                 }
             } else if *diff < 0
-                && let Some(id) = self.interner.get(&self.db, &event.id)?
+                && let Some(id) = self.intern_get(&event.id)?
                 && let Some(existing) = self.get_event(id)?
             {
-                self.delete_event(&mut batch, &mut shard_batches, &existing);
+                self.delete_event(&mut event_batch, &existing);
                 notifications.push((existing, *ts, -1));
             }
         }
 
-        self.db.write(std::mem::take(&mut batch.write_batch))?;
-        for (shard_id, shard_batch) in shard_batches {
-            self.event_shards[shard_id].write(shard_batch)?;
-        }
+        self.interner_db
+            .write(std::mem::take(&mut intern_batch.write_batch))?;
+        self.db.write(event_batch)?;
 
-        let new_upper = max_ts + 1;
-        self.save_checkpoint(new_upper)?;
+        Ok((max_ts.map(|ts| ts + 1), notifications))
+    }
 
-        for (event, ts, diff) in notifications.drain(..) {
+    fn notify_all(&self, notifications: Vec<PersistUpdate>) {
+        for (event, ts, diff) in notifications {
             self.notify(event, ts, diff);
         }
-
-        Ok(())
     }
 
     fn parse_and_intern_tags(
@@ -432,15 +466,13 @@ impl PersistStore {
         };
 
         let id_bytes = self
-            .interner
-            .resolve(&self.db, record.id)?
+            .resolve_node(record.id)?
             .ok_or_else(|| anyhow::anyhow!("missing interner entry for event id {}", record.id))?
             .try_into()
             .map_err(|v: Vec<u8>| anyhow::anyhow!("event id is not 32 bytes (len={})", v.len()))?;
 
         let pubkey_bytes = self
-            .interner
-            .resolve(&self.db, record.pubkey)?
+            .resolve_node(record.pubkey)?
             .ok_or_else(|| anyhow::anyhow!("missing interner entry for pubkey {}", record.pubkey))?
             .try_into()
             .map_err(|v: Vec<u8>| anyhow::anyhow!("pubkey is not 32 bytes (len={})", v.len()))?;
@@ -513,6 +545,12 @@ mod tests {
             .unwrap();
 
         invoice.to_string()
+    }
+
+    fn addressable_test_tags(d_tag: &str, pubkey: [u8; 32]) -> Vec<u8> {
+        serde_json::json!([["d", d_tag], ["p", hex::encode(pubkey)]])
+            .to_string()
+            .into_bytes()
     }
 
     #[test]
@@ -669,8 +707,8 @@ mod tests {
 
         let event = store.insert_event(&raw).unwrap().unwrap();
         let stored = store.get_event(event.id).unwrap().unwrap();
-        let recipient_node = store.interner.intern(&store.db, &recipient).unwrap();
-        let sender_node = store.interner.intern(&store.db, &sender).unwrap();
+        let recipient_node = store.intern(&recipient).unwrap();
+        let sender_node = store.intern(&sender).unwrap();
 
         assert!(stored.tags.contains(&Edge::Pubkey(recipient_node)));
         assert!(stored.tags.contains(&Edge::PubkeyUpper(sender_node)));
@@ -786,7 +824,7 @@ mod tests {
 
         assert_eq!(store.load_checkpoint().unwrap(), Some(201));
 
-        let id = |raw: &EventRaw| store.interner.get(&store.db, &raw.id).unwrap().unwrap();
+        let id = |raw: &EventRaw| store.intern_get(&raw.id).unwrap().unwrap();
 
         assert!(store.get_event(id(&event_1)).unwrap().is_some());
         assert!(store.get_event(id(&replaceable_2)).unwrap().is_some());
@@ -819,7 +857,7 @@ mod tests {
         store.apply_updates(&[(new_event.clone(), 200, 1)]).unwrap();
 
         let notifications: Vec<_> = std::iter::from_fn(|| sub.try_recv().ok()).collect();
-        let resolve = |id| store.interner.resolve(&store.db, id).unwrap().unwrap();
+        let resolve = |id| store.resolve_node(id).unwrap().unwrap();
 
         // assert old_event
         assert_eq!(
@@ -836,5 +874,134 @@ mod tests {
             (&resolve(notifications[2].0.id), notifications[2].2),
             (&new_event.id.to_vec(), 1)
         );
+    }
+
+    #[test]
+    fn assert_generated_updates_notify_addressable_replacement_without_checkpoint() {
+        let store = TestStore::default();
+        let mut sub = store.subscribe(0, 1);
+
+        let pubkey = [1u8; 32];
+        let old_event = event_raw!(
+            id: [2u8; 32], pubkey, kind: 31313, created_at: 1000,
+            tags_json: addressable_test_tags("sage_test", pubkey)
+        );
+        let new_event = event_raw!(
+            id: [3u8; 32], pubkey, kind: 31313, created_at: 2000,
+            tags_json: addressable_test_tags("sage_test", pubkey)
+        );
+
+        store
+            .apply_generated_updates(&[(old_event.clone(), 1, 1)])
+            .unwrap();
+        assert_eq!(store.load_checkpoint().unwrap(), None);
+
+        store
+            .apply_generated_updates(&[(new_event.clone(), 1, 1)])
+            .unwrap();
+        assert_eq!(store.load_checkpoint().unwrap(), None);
+
+        let old_id = store.intern_get(&old_event.id).unwrap().unwrap();
+        let new_id = store.intern_get(&new_event.id).unwrap().unwrap();
+        assert!(store.get_event(old_id).unwrap().is_none());
+        assert!(store.get_event(new_id).unwrap().is_some());
+
+        let current_events: Vec<_> = store.iter_events(PersistQuery::default()).collect();
+        let current_ids: Vec<_> = current_events.iter().map(|event| event.id).collect();
+        assert_eq!(current_ids, vec![new_id]);
+
+        let notifications: Vec<_> = std::iter::from_fn(|| sub.try_recv().ok()).collect();
+        let resolve = |id| store.resolve_node(id).unwrap().unwrap();
+
+        assert_eq!(notifications.len(), 3);
+        assert_eq!(
+            (&resolve(notifications[0].0.id), notifications[0].2),
+            (&old_event.id.to_vec(), 1)
+        );
+        assert_eq!(
+            (&resolve(notifications[1].0.id), notifications[1].2),
+            (&old_event.id.to_vec(), -1)
+        );
+        assert_eq!(
+            (&resolve(notifications[2].0.id), notifications[2].2),
+            (&new_event.id.to_vec(), 1)
+        );
+    }
+
+    #[test]
+    fn assert_generated_updates_replace_addressable_within_same_batch() {
+        let store = TestStore::default();
+
+        let pubkey = [1u8; 32];
+        let old_event = event_raw!(
+            id: [2u8; 32], pubkey, kind: 31313, created_at: 1000,
+            tags_json: addressable_test_tags("sage_test", pubkey)
+        );
+        let new_event = event_raw!(
+            id: [3u8; 32], pubkey, kind: 31313, created_at: 2000,
+            tags_json: addressable_test_tags("sage_test", pubkey)
+        );
+
+        store
+            .apply_generated_updates(&[(old_event.clone(), 1, 1), (new_event.clone(), 1, 1)])
+            .unwrap();
+
+        let old_id = store.intern_get(&old_event.id).unwrap().unwrap();
+        let new_id = store.intern_get(&new_event.id).unwrap().unwrap();
+
+        assert!(store.get_event(old_id).unwrap().is_none());
+        assert!(store.get_original_event(old_id).unwrap().is_none());
+        assert!(store.get_event(new_id).unwrap().is_some());
+        assert!(store.get_original_event(new_id).unwrap().is_some());
+
+        let current_events: Vec<_> = store.iter_events(PersistQuery::default()).collect();
+        let current_ids: Vec<_> = current_events.iter().map(|event| event.id).collect();
+        assert_eq!(current_ids, vec![new_id]);
+    }
+
+    #[test]
+    fn assert_generated_updates_keep_newer_addressable_when_batch_order_reversed() {
+        let store = TestStore::default();
+
+        let pubkey = [1u8; 32];
+        let old_event = event_raw!(
+            id: [2u8; 32], pubkey, kind: 31313, created_at: 1000,
+            tags_json: addressable_test_tags("sage_test", pubkey)
+        );
+        let new_event = event_raw!(
+            id: [3u8; 32], pubkey, kind: 31313, created_at: 2000,
+            tags_json: addressable_test_tags("sage_test", pubkey)
+        );
+
+        store
+            .apply_generated_updates(&[(new_event.clone(), 1, 1), (old_event.clone(), 1, 1)])
+            .unwrap();
+
+        let old_id = store.intern_get(&old_event.id).unwrap().unwrap();
+        let new_id = store.intern_get(&new_event.id).unwrap().unwrap();
+
+        assert!(store.get_event(old_id).unwrap().is_none());
+        assert!(store.get_original_event(old_id).unwrap().is_none());
+        assert!(store.get_event(new_id).unwrap().is_some());
+        assert!(store.get_original_event(new_id).unwrap().is_some());
+
+        let current_events: Vec<_> = store.iter_events(PersistQuery::default()).collect();
+        let current_ids: Vec<_> = current_events.iter().map(|event| event.id).collect();
+        assert_eq!(current_ids, vec![new_id]);
+    }
+
+    #[test]
+    fn assert_duplicate_event_id_in_same_batch_is_inserted_once() {
+        let store = TestStore::default();
+        let raw = event_raw!(id: [2u8; 32], pubkey: [1u8; 32], kind: 1, created_at: 1000);
+
+        store
+            .apply_generated_updates(&[(raw.clone(), 1, 1), (raw.clone(), 1, 1)])
+            .unwrap();
+
+        let event_id = store.intern_get(&raw.id).unwrap().unwrap();
+        let current_events: Vec<_> = store.iter_events(PersistQuery::default()).collect();
+        let current_ids: Vec<_> = current_events.iter().map(|event| event.id).collect();
+        assert_eq!(current_ids, vec![event_id]);
     }
 }

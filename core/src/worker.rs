@@ -1,11 +1,12 @@
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use nostr_sdk::filter::MatchEventOptions;
 use timely::{communication::Allocate, worker::Worker as TimelyWorker};
 use transport::server::{Request, Response};
 
 use crate::{
-    query::filter::{DataflowFilter, DataflowFilterTags},
+    query::filter::{DataflowFilter, effective_query_limit},
     state::State,
 };
 
@@ -41,12 +42,26 @@ impl<'a, A: Allocate> Worker<'a, A> {
 
     fn handle_request(&mut self, request: Request) {
         let request_id = request.request_id;
-        let Some(filter) =
-            DataflowFilter::from_nostr_filter(request.filter.clone(), &self.state.persist)
+        let mut candidate_filter = request.filter.clone();
+        let response_limit = effective_query_limit(candidate_filter.limit);
+        candidate_filter.limit = Some(response_limit);
+
+        if response_limit == 0 {
+            let _ = self.res_tx.send(Response::Result {
+                request_id,
+                events: vec![],
+            });
+            let _ = self.res_tx.send(Response::Eose { request_id });
+            return;
+        }
+
+        let Some(filter) = DataflowFilter::from_nostr_filter(candidate_filter, &self.state.persist)
         else {
-            tracing::error!(
-                "[Worker {}] DataflowFilter: None (no matching interned values)",
-                self.worker_id
+            tracing::warn!(
+                "[Worker {}] request_id={} filter conversion returned none: {:?}",
+                self.worker_id,
+                request_id,
+                request.filter
             );
             let _ = self.res_tx.send(Response::Result {
                 request_id,
@@ -57,22 +72,32 @@ impl<'a, A: Allocate> Worker<'a, A> {
         };
 
         match self.state.query(&filter) {
-            Ok(event_rows) => {
-                let event_ids: Vec<u32> = event_rows.iter().map(|row| row.id).collect();
-                let event_ids_len = event_ids.len();
-                let events = event_ids
-                    .into_iter()
-                    .filter_map(|id| self.state.persist.get_original_event(id).ok())
-                    .flatten()
-                    .collect::<Vec<nostr_sdk::event::Event>>();
+            Ok(event_ids) => {
+                let mut events = Vec::new();
 
-                tracing::debug!(
-                    "[Worker {}] [request_id={}] {} rows retrieved ({} row resolved)",
-                    self.worker_id,
-                    request_id,
-                    event_ids_len,
-                    events.len(),
-                );
+                for id in event_ids {
+                    if events.len() >= response_limit {
+                        break;
+                    }
+
+                    match self.state.persist.get_original_event(id) {
+                        Ok(Some(event))
+                            if request.filter.match_event(&event, MatchEventOptions::new()) =>
+                        {
+                            events.push(event);
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                "[Worker {}] request_id={} failed to resolve event_id={}: {:?}",
+                                self.worker_id,
+                                request_id,
+                                id,
+                                err
+                            );
+                        }
+                    }
+                }
                 let _ = self.res_tx.send(Response::Result { request_id, events });
             }
             Err(err) => {

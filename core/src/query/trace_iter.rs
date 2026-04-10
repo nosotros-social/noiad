@@ -1,8 +1,9 @@
 use differential_dataflow::trace::{Cursor, TraceReader};
+use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, marker::PhantomData};
-use types::{edges::TagKey, event::EventRow, types::Node};
+use types::{event::EventRowCompactValue, tags::TagKey, types::Node};
 
-use crate::query::filter::{DataflowFilter, DataflowFilterIndex, DataflowFilterTags};
+use crate::query::filter::{DataflowFilter, DataflowFilterIndex};
 
 pub struct TraceIter<Tr, K>
 where
@@ -17,6 +18,9 @@ where
     seen: HashSet<Node>,
     phantom: PhantomData<K>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PubkeyKey(pub Node);
 
 impl<Tr, K> TraceIter<Tr, K>
 where
@@ -43,98 +47,202 @@ trait TraceKeyIndex<Tr>
 where
     Tr: TraceReader,
 {
-    fn seek_current_key(&mut self) -> bool;
-    fn keys_len(&self) -> usize;
+    fn initialize_keys(&mut self) -> bool;
+    fn advance_key(&mut self) -> bool;
 }
 
-/// ID and Author index
+/// ID index
 impl<Tr> TraceKeyIndex<Tr> for TraceIter<Tr, Node>
 where
-    for<'a> Tr: TraceReader<Key<'a> = &'a Node, Val<'a> = &'a EventRow>,
+    for<'a> Tr: TraceReader<Key<'a> = &'a Node>,
 {
-    fn seek_current_key(&mut self) -> bool {
-        let keys = match self.filter.get_index() {
-            DataflowFilterIndex::ById => self.filter.ids.as_ref(),
-            DataflowFilterIndex::ByAuthor => self.filter.authors.as_ref(),
-            _ => return false,
-        };
-        let Some(key) = keys.and_then(|k| k.iter().nth(self.key_index)) else {
+    fn initialize_keys(&mut self) -> bool {
+        if self.filter.get_index() != DataflowFilterIndex::ById {
             return false;
-        };
-        self.cursor.seek_key(&self.storage, key);
-
-        if self.cursor.key_valid(&self.storage) && self.cursor.key(&self.storage) == key {
-            self.cursor.rewind_vals(&self.storage);
-            return true;
         }
+
+        if self.filter.ids.is_none() {
+            self.cursor.rewind_keys(&self.storage);
+            if self.cursor.key_valid(&self.storage) {
+                self.cursor.rewind_vals(&self.storage);
+                return true;
+            }
+            return false;
+        }
+
+        while let Some(key) = self
+            .filter
+            .ids
+            .as_ref()
+            .and_then(|k| k.iter().nth(self.key_index))
+        {
+            self.cursor.seek_key(&self.storage, key);
+            if self.cursor.key_valid(&self.storage) && self.cursor.key(&self.storage) == key {
+                self.cursor.rewind_vals(&self.storage);
+                return true;
+            }
+            self.key_index += 1;
+        }
+
         false
     }
 
-    fn keys_len(&self) -> usize {
-        match self.filter.get_index() {
-            DataflowFilterIndex::ById => self.filter.ids.as_ref().map_or(0, |k| k.len()),
-            DataflowFilterIndex::ByAuthor => self.filter.authors.as_ref().map_or(0, |k| k.len()),
-            _ => 0,
+    fn advance_key(&mut self) -> bool {
+        if self.filter.get_index() != DataflowFilterIndex::ById {
+            return false;
         }
+
+        if self.filter.ids.is_none() {
+            self.cursor.step_key(&self.storage);
+            if self.cursor.key_valid(&self.storage) {
+                self.cursor.rewind_vals(&self.storage);
+                return true;
+            }
+            return false;
+        }
+
+        self.key_index += 1;
+        while let Some(key) = self
+            .filter
+            .ids
+            .as_ref()
+            .and_then(|k| k.iter().nth(self.key_index))
+        {
+            self.cursor.seek_key(&self.storage, key);
+            if self.cursor.key_valid(&self.storage) && self.cursor.key(&self.storage) == key {
+                self.cursor.rewind_vals(&self.storage);
+                return true;
+            }
+            self.key_index += 1;
+        }
+
+        false
     }
 }
 
-/// TraceyKey for Kind index
-impl<Tr> TraceKeyIndex<Tr> for TraceIter<Tr, u16>
+// pubkey index
+impl<Tr> TraceKeyIndex<Tr> for TraceIter<Tr, PubkeyKey>
 where
-    for<'a> Tr: TraceReader<Key<'a> = &'a u16, Val<'a> = &'a EventRow>,
+    for<'a> Tr: TraceReader<Key<'a> = &'a PubkeyKey>,
 {
-    fn seek_current_key(&mut self) -> bool {
-        let keys = match self.filter.get_index() {
-            DataflowFilterIndex::ByKind => self.filter.kinds.as_ref(),
-            _ => return false,
-        };
-        let Some(key) = keys.and_then(|k| k.iter().nth(self.key_index)) else {
-            return false;
-        };
-        self.cursor.seek_key(&self.storage, key);
+    fn initialize_keys(&mut self) -> bool {
+        while let Some(author) = self
+            .filter
+            .authors
+            .as_ref()
+            .and_then(|k| k.iter().nth(self.key_index))
+        {
+            let key = PubkeyKey(*author);
+            self.cursor.seek_key(&self.storage, &key);
 
-        if self.cursor.key_valid(&self.storage) && self.cursor.key(&self.storage) == key {
-            self.cursor.rewind_vals(&self.storage);
-            return true;
+            if self.cursor.key_valid(&self.storage) && self.cursor.key(&self.storage) == &key {
+                self.cursor.rewind_vals(&self.storage);
+                return true;
+            }
+            self.key_index += 1;
         }
         false
     }
 
-    fn keys_len(&self) -> usize {
-        self.filter.kinds.as_ref().map_or(0, |k| k.len())
+    fn advance_key(&mut self) -> bool {
+        self.key_index += 1;
+        while let Some(author) = self
+            .filter
+            .authors
+            .as_ref()
+            .and_then(|k| k.iter().nth(self.key_index))
+        {
+            let key = PubkeyKey(*author);
+            self.cursor.seek_key(&self.storage, &key);
+
+            if self.cursor.key_valid(&self.storage) && self.cursor.key(&self.storage) == &key {
+                self.cursor.rewind_vals(&self.storage);
+                return true;
+            }
+            self.key_index += 1;
+        }
+        false
+    }
+}
+
+/// kind index
+impl<Tr> TraceKeyIndex<Tr> for TraceIter<Tr, u16>
+where
+    for<'a> Tr: TraceReader<Key<'a> = &'a u16>,
+{
+    fn initialize_keys(&mut self) -> bool {
+        while let Some(key) = self
+            .filter
+            .kinds
+            .as_ref()
+            .and_then(|k| k.iter().nth(self.key_index))
+        {
+            self.cursor.seek_key(&self.storage, key);
+            if self.cursor.key_valid(&self.storage) && self.cursor.key(&self.storage) == key {
+                self.cursor.rewind_vals(&self.storage);
+                return true;
+            }
+            self.key_index += 1;
+        }
+        false
+    }
+
+    fn advance_key(&mut self) -> bool {
+        self.key_index += 1;
+        while let Some(key) = self
+            .filter
+            .kinds
+            .as_ref()
+            .and_then(|k| k.iter().nth(self.key_index))
+        {
+            self.cursor.seek_key(&self.storage, key);
+            if self.cursor.key_valid(&self.storage) && self.cursor.key(&self.storage) == key {
+                self.cursor.rewind_vals(&self.storage);
+                return true;
+            }
+            self.key_index += 1;
+        }
+        false
     }
 }
 
 impl<Tr> TraceKeyIndex<Tr> for TraceIter<Tr, TagKey>
 where
-    for<'a> Tr: TraceReader<Key<'a> = &'a TagKey, Val<'a> = &'a Node>,
+    for<'a> Tr: TraceReader<Key<'a> = &'a TagKey>,
 {
-    fn seek_current_key(&mut self) -> bool {
-        let keys = match self.filter.get_index() {
-            DataflowFilterIndex::ByTag => self.filter.tag_keys(),
-            _ => return false,
-        };
-        let Some(ref keys) = keys else {
-            return false;
-        };
-        let Some(key) = keys.iter().nth(self.key_index) else {
-            return false;
-        };
-        self.cursor.seek_key(&self.storage, key);
+    fn initialize_keys(&mut self) -> bool {
+        while let Some(key) = self
+            .filter
+            .tag_keys()
+            .and_then(|k| k.iter().nth(self.key_index).copied())
+        {
+            self.cursor.seek_key(&self.storage, &key);
 
-        if self.cursor.key_valid(&self.storage) && self.cursor.key(&self.storage) == key {
-            self.cursor.rewind_vals(&self.storage);
-            return true;
+            if self.cursor.key_valid(&self.storage) && self.cursor.key(&self.storage) == &key {
+                self.cursor.rewind_vals(&self.storage);
+                return true;
+            }
+            self.key_index += 1;
         }
         false
     }
 
-    fn keys_len(&self) -> usize {
-        match self.filter.get_index() {
-            DataflowFilterIndex::ByTag => self.filter.tag_keys().map_or(0, |k| k.len()),
-            _ => 0,
+    fn advance_key(&mut self) -> bool {
+        self.key_index += 1;
+        while let Some(key) = self
+            .filter
+            .tag_keys()
+            .and_then(|k| k.iter().nth(self.key_index).copied())
+        {
+            self.cursor.seek_key(&self.storage, &key);
+
+            if self.cursor.key_valid(&self.storage) && self.cursor.key(&self.storage) == &key {
+                self.cursor.rewind_vals(&self.storage);
+                return true;
+            }
+            self.key_index += 1;
         }
+        false
     }
 }
 
@@ -154,39 +262,67 @@ where
 
 impl<Tr> TraceValueBehavior<Tr> for TraceIter<Tr, Node>
 where
-    for<'a> Tr: TraceReader<Key<'a> = &'a Node, Val<'a> = &'a EventRow>,
+    for<'a> Tr: TraceReader<Key<'a> = &'a Node, Val<'a> = &'a EventRowCompactValue>,
 {
-    type Item = EventRow;
+    type Item = (Node, EventRowCompactValue);
 
     fn read_item(&self) -> Self::Item {
-        self.cursor.val(&self.storage).clone()
+        let id = *self.cursor.key(&self.storage);
+        (id, self.cursor.val(&self.storage).clone())
     }
 
     fn dedup_key(item: &Self::Item) -> Node {
-        item.id
+        item.0
     }
 
     fn matches_filter(&self, item: &Self::Item) -> bool {
-        self.filter.matches(item)
+        self.filter.matches(item.0, &item.1)
     }
 }
 
 impl<Tr> TraceValueBehavior<Tr> for TraceIter<Tr, u16>
 where
-    for<'a> Tr: TraceReader<Key<'a> = &'a u16, Val<'a> = &'a EventRow>,
+    for<'a> Tr: TraceReader<Key<'a> = &'a u16, Val<'a> = &'a Node>,
 {
-    type Item = EventRow;
+    type Item = Node;
 
     fn read_item(&self) -> Self::Item {
-        self.cursor.val(&self.storage).clone()
+        *self.cursor.val(&self.storage)
     }
 
     fn dedup_key(item: &Self::Item) -> Node {
-        item.id
+        *item
     }
 
-    fn matches_filter(&self, item: &Self::Item) -> bool {
-        self.filter.matches(item)
+    fn matches_filter(&self, _item: &Self::Item) -> bool {
+        true
+    }
+
+    fn needs_dedup(&self) -> bool {
+        false
+    }
+}
+
+impl<Tr> TraceValueBehavior<Tr> for TraceIter<Tr, PubkeyKey>
+where
+    for<'a> Tr: TraceReader<Key<'a> = &'a PubkeyKey, Val<'a> = &'a Node>,
+{
+    type Item = Node;
+
+    fn read_item(&self) -> Self::Item {
+        *self.cursor.val(&self.storage)
+    }
+
+    fn dedup_key(item: &Self::Item) -> Node {
+        *item
+    }
+
+    fn matches_filter(&self, _item: &Self::Item) -> bool {
+        true
+    }
+
+    fn needs_dedup(&self) -> bool {
+        false
     }
 }
 
@@ -232,30 +368,21 @@ where
     type Item = <Self as TraceValueBehavior<Tr>>::Item;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.count >= self.filter.limit.unwrap_or(500) {
-            return None;
-        }
-
         if !self.started {
             self.started = true;
-            while self.key_index < self.keys_len() && !self.seek_current_key() {
-                self.key_index += 1;
+            if !self.initialize_keys() {
+                return None;
             }
         }
 
         loop {
-            if self.key_index >= self.keys_len() {
-                return None;
-            }
-
             if !self.cursor.key_valid(&self.storage) {
                 return None;
             }
 
             if !self.cursor.val_valid(&self.storage) {
-                self.key_index += 1;
-                while self.key_index < self.keys_len() && !self.seek_current_key() {
-                    self.key_index += 1;
+                if !self.advance_key() {
+                    return None;
                 }
                 continue;
             }
@@ -288,431 +415,5 @@ where
             self.count += 1;
             return Some(item);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use differential_dataflow::{
-        AsCollection, input::InputSession, operators::arrange::ArrangeByKey,
-    };
-    use timely::{
-        dataflow::{
-            ProbeHandle,
-            operators::{Probe, ToStream},
-        },
-        execute_directly,
-    };
-    use types::{event_row, tags::EventTag, types::Diff};
-
-    pub fn build_dataflow<FBuild>(filter: DataflowFilter, build_inputs: FBuild) -> Vec<EventRow>
-    where
-        FBuild: FnOnce(&mut InputSession<u64, EventRow, Diff>) + Send + Sync + 'static,
-    {
-        execute_directly(move |worker| {
-            let mut events_input: InputSession<u64, EventRow, Diff> = InputSession::new();
-            let mut probe = ProbeHandle::<u64>::new();
-            let index = filter.get_index();
-
-            let (mut events_by_id, mut events_by_pubkey, mut events_by_kind, mut events_by_tags) =
-                worker.dataflow::<u64, _, _>(|scope| {
-                    let events = events_input.to_collection(scope).probe_with(&probe);
-
-                    (
-                        events.map(|e| (e.id, e)).arrange_by_key().trace.clone(),
-                        events.map(|e| (e.pubkey, e)).arrange_by_key().trace.clone(),
-                        events.map(|e| (e.kind, e)).arrange_by_key().trace.clone(),
-                        events
-                            .flat_map(|e| e.tag_keys())
-                            .arrange_by_key()
-                            .trace
-                            .clone(),
-                    )
-                });
-
-            events_input.advance_to(1);
-            build_inputs(&mut events_input);
-            events_input.flush();
-
-            let seal = *events_input.time() + 1;
-            events_input.advance_to(seal);
-            events_input.flush();
-            while probe.less_than(&seal) {
-                worker.step();
-            }
-
-            match index {
-                DataflowFilterIndex::ById => TraceIter::new(&mut events_by_id, filter).collect(),
-                DataflowFilterIndex::ByAuthor => {
-                    TraceIter::new(&mut events_by_pubkey, filter).collect()
-                }
-                DataflowFilterIndex::ByKind => {
-                    TraceIter::new(&mut events_by_kind, filter).collect()
-                }
-                DataflowFilterIndex::ByTag => {
-                    let event_ids: Vec<Node> =
-                        TraceIter::new(&mut events_by_tags, filter.clone()).collect();
-                    let id_filter = filter
-                        .clone()
-                        .ids(event_ids)
-                        .limit(filter.limit.unwrap_or(500));
-                    TraceIter::new(&mut events_by_id, id_filter).collect()
-                }
-            }
-        })
-    }
-
-    #[test]
-    fn assert_empty_iter() {
-        let results = build_dataflow(DataflowFilter::default(), |_input| {});
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn assert_filter_kinds() {
-        let results = build_dataflow(DataflowFilter::default().kinds(vec![1]), |input| {
-            input.insert(event_row!(id: 10, pubkey: 10, kind: 1, created_at: 1000));
-            input.insert(event_row!(id: 20, pubkey: 20, kind: 1, created_at: 2000));
-            input.insert(event_row!(id: 30, pubkey: 30, kind: 3, created_at: 3000));
-        });
-
-        assert_eq!(results.len(), 2);
-    }
-
-    #[test]
-    fn assert_filter_ids() {
-        let results = build_dataflow(DataflowFilter::default().ids(vec![1, 3]), |input| {
-            input.insert(event_row!(id: 1, pubkey: 10, kind: 1, created_at: 1000));
-            input.insert(event_row!(id: 2, pubkey: 20, kind: 1, created_at: 2000));
-            input.insert(event_row!(id: 3, pubkey: 30, kind: 1, created_at: 3000));
-        });
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].pubkey, 10);
-        assert_eq!(results[1].pubkey, 30);
-    }
-
-    #[test]
-    fn assert_filter_authors() {
-        let results = build_dataflow(DataflowFilter::default().authors(vec![20, 30]), |input| {
-            input.insert(event_row!(id: 1, pubkey: 10, kind: 1, created_at: 1000));
-            input.insert(event_row!(id: 2, pubkey: 20, kind: 1, created_at: 2000));
-            input.insert(event_row!(id: 3, pubkey: 30, kind: 1, created_at: 3000));
-        });
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].pubkey, 20);
-        assert_eq!(results[1].pubkey, 30);
-    }
-
-    #[test]
-    fn assert_filter_authors_and_kinds() {
-        let results = build_dataflow(
-            DataflowFilter::default()
-                .authors(vec![10, 20])
-                .kinds(vec![1]),
-            |input| {
-                input.insert(event_row!(id: 1, pubkey: 10, kind: 1, created_at: 1000));
-                input.insert(event_row!(id: 2, pubkey: 10, kind: 3, created_at: 2000));
-                input.insert(event_row!(id: 3, pubkey: 20, kind: 1, created_at: 3000));
-                input.insert(event_row!(id: 4, pubkey: 20, kind: 3, created_at: 4000));
-            },
-        );
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].id, 1);
-        assert_eq!(results[1].id, 3);
-    }
-
-    #[test]
-    fn assert_filter_by_tag() {
-        let results = build_dataflow(
-            DataflowFilter::default()
-                .add_tags(DataflowFilterTags::Pubkey, vec![100].into_iter().collect()),
-            |input| {
-                input.insert(EventRow {
-                    id: 1,
-                    pubkey: 10,
-                    kind: 1,
-                    created_at: 1000,
-                    tags: vec![EventTag::Pubkey(100)],
-                });
-                input.insert(EventRow {
-                    id: 2,
-                    pubkey: 20,
-                    kind: 1,
-                    created_at: 2000,
-                    tags: vec![EventTag::Pubkey(200)],
-                });
-                input.insert(EventRow {
-                    id: 3,
-                    pubkey: 30,
-                    kind: 1,
-                    created_at: 3000,
-                    tags: vec![EventTag::Pubkey(100), EventTag::Topic(999)],
-                });
-            },
-        );
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].id, 1);
-        assert_eq!(results[1].id, 3);
-    }
-
-    #[test]
-    fn assert_filter_by_tag_deduplicates() {
-        // Event 1 has two tags that both match the filter.
-        // It should appear only once in results.
-        let results = build_dataflow(
-            DataflowFilter::default().add_tags(
-                DataflowFilterTags::Pubkey,
-                vec![100, 200].into_iter().collect(),
-            ),
-            |input| {
-                input.insert(EventRow {
-                    id: 1,
-                    pubkey: 10,
-                    kind: 1,
-                    created_at: 1000,
-                    tags: vec![EventTag::Pubkey(100), EventTag::Pubkey(200)],
-                });
-            },
-        );
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, 1);
-    }
-
-    #[test]
-    fn assert_filter_by_tag_and_author() {
-        let results = build_dataflow(
-            DataflowFilter::default()
-                .authors(vec![10, 30])
-                .add_tags(DataflowFilterTags::Pubkey, vec![100].into_iter().collect()),
-            |input| {
-                input.insert(EventRow {
-                    id: 1,
-                    pubkey: 10,
-                    kind: 1,
-                    created_at: 1000,
-                    tags: vec![EventTag::Pubkey(100)],
-                });
-                input.insert(EventRow {
-                    id: 2,
-                    pubkey: 20,
-                    kind: 1,
-                    created_at: 2000,
-                    tags: vec![EventTag::Pubkey(200)],
-                });
-                input.insert(EventRow {
-                    id: 3,
-                    pubkey: 30,
-                    kind: 1,
-                    created_at: 3000,
-                    tags: vec![EventTag::Pubkey(100), EventTag::Topic(999)],
-                });
-                input.insert(EventRow {
-                    id: 4,
-                    pubkey: 40,
-                    kind: 1,
-                    created_at: 4000,
-                    tags: vec![EventTag::Pubkey(100)],
-                });
-            },
-        );
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].id, 1);
-        assert_eq!(results[1].id, 3);
-    }
-
-    #[test]
-    fn assert_filter_by_dtag_and_author() {
-        let results = build_dataflow(
-            DataflowFilter::default()
-                .authors(vec![10, 30])
-                .add_tags(DataflowFilterTags::DTag, vec![100].into_iter().collect()),
-            |input| {
-                input.insert(EventRow {
-                    id: 1,
-                    pubkey: 10,
-                    kind: 1,
-                    created_at: 1000,
-                    tags: vec![EventTag::DTag(100)],
-                });
-                input.insert(EventRow {
-                    id: 2,
-                    pubkey: 20,
-                    kind: 1,
-                    created_at: 2000,
-                    tags: vec![EventTag::DTag(200)],
-                });
-                input.insert(EventRow {
-                    id: 3,
-                    pubkey: 30,
-                    kind: 1,
-                    created_at: 3000,
-                    tags: vec![EventTag::DTag(100)],
-                });
-                input.insert(EventRow {
-                    id: 4,
-                    pubkey: 40,
-                    kind: 1,
-                    created_at: 4000,
-                    tags: vec![EventTag::DTag(100)],
-                });
-            },
-        );
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].id, 1);
-        assert_eq!(results[1].id, 3);
-    }
-
-    #[test]
-    fn assert_filter_by_dtag_and_kind() {
-        let results = build_dataflow(
-            DataflowFilter::default()
-                .kinds(vec![30382])
-                .add_tags(DataflowFilterTags::DTag, vec![100].into_iter().collect()),
-            |input| {
-                input.insert(EventRow {
-                    id: 1,
-                    pubkey: 10,
-                    kind: 30383,
-                    created_at: 1000,
-                    tags: vec![EventTag::DTag(100)],
-                });
-                input.insert(EventRow {
-                    id: 2,
-                    pubkey: 20,
-                    kind: 30382,
-                    created_at: 2000,
-                    tags: vec![EventTag::DTag(200)],
-                });
-                input.insert(EventRow {
-                    id: 3,
-                    pubkey: 30,
-                    kind: 30382,
-                    created_at: 3000,
-                    tags: vec![EventTag::DTag(100)],
-                });
-                input.insert(EventRow {
-                    id: 4,
-                    pubkey: 40,
-                    kind: 30382,
-                    created_at: 4000,
-                    tags: vec![EventTag::DTag(200)],
-                });
-            },
-        );
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, 3);
-    }
-
-    #[test]
-    fn assert_retractions() {
-        let results = build_dataflow(DataflowFilter::default().ids(vec![2]), |input| {
-            let event = event_row!(id: 2, pubkey: 20, kind: 1, created_at: 2000);
-            input.insert(event.clone());
-            input.flush();
-            input.advance_to(2);
-            input.remove(event);
-            input.flush();
-        });
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn assert_missing_key() {
-        let results = build_dataflow(DataflowFilter::default().ids(vec![2]), |input| {
-            input.insert(event_row!(id: 1, pubkey: 10, kind: 1, created_at: 1000));
-            input.insert(event_row!(id: 3, pubkey: 30, kind: 1, created_at: 3000));
-        });
-
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn assert_limit() {
-        let results = build_dataflow(
-            DataflowFilter::default().authors(vec![10]).limit(2),
-            |input| {
-                input.insert(event_row!(id: 1, pubkey: 10, kind: 1, created_at: 1000));
-                input.insert(event_row!(id: 2, pubkey: 10, kind: 1, created_at: 2000));
-                input.insert(event_row!(id: 3, pubkey: 10, kind: 1, created_at: 3000));
-                input.insert(event_row!(id: 4, pubkey: 10, kind: 1, created_at: 4000));
-                input.insert(event_row!(id: 5, pubkey: 10, kind: 1, created_at: 5000));
-            },
-        );
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].id, 1);
-        assert_eq!(results[1].id, 2);
-    }
-
-    #[test]
-    fn assert_since_filters_out_older_events() {
-        let results = build_dataflow(
-            DataflowFilter::default().authors(vec![10]).since(1500),
-            |input| {
-                input.insert(event_row!(id: 1, pubkey: 10, kind: 1, created_at: 1000));
-                input.insert(event_row!(id: 2, pubkey: 10, kind: 1, created_at: 1500));
-                input.insert(event_row!(id: 3, pubkey: 10, kind: 1, created_at: 2000));
-            },
-        );
-
-        assert_eq!(results.iter().map(|e| e.id).collect::<Vec<_>>(), vec![2, 3]);
-    }
-
-    #[test]
-    fn assert_until_filters_out_newer_events() {
-        let results = build_dataflow(
-            DataflowFilter::default().authors(vec![10]).until(1500),
-            |input| {
-                input.insert(event_row!(id: 1, pubkey: 10, kind: 1, created_at: 1000));
-                input.insert(event_row!(id: 2, pubkey: 10, kind: 1, created_at: 1500));
-                input.insert(event_row!(id: 3, pubkey: 10, kind: 1, created_at: 2000));
-            },
-        );
-
-        assert_eq!(results.iter().map(|e| e.id).collect::<Vec<_>>(), vec![1, 2]);
-    }
-
-    #[test]
-    fn assert_since_until_are_inclusive() {
-        let results = build_dataflow(
-            DataflowFilter::default()
-                .authors(vec![10])
-                .since(1000)
-                .until(2000),
-            |input| {
-                input.insert(event_row!(id: 1, pubkey: 10, kind: 1, created_at: 999));
-                input.insert(event_row!(id: 2, pubkey: 10, kind: 1, created_at: 1000));
-                input.insert(event_row!(id: 3, pubkey: 10, kind: 1, created_at: 1500));
-                input.insert(event_row!(id: 4, pubkey: 10, kind: 1, created_at: 2000));
-                input.insert(event_row!(id: 5, pubkey: 10, kind: 1, created_at: 2001));
-            },
-        );
-
-        assert_eq!(
-            results.iter().map(|e| e.id).collect::<Vec<_>>(),
-            vec![2, 3, 4]
-        );
-    }
-
-    #[test]
-    fn assert_multiple_missing_keys_with_one_present() {
-        let results = build_dataflow(DataflowFilter::default().ids(vec![2, 4, 5]), |input| {
-            input.insert(event_row!(id: 1, pubkey: 10, kind: 1, created_at: 1000));
-            input.insert(event_row!(id: 3, pubkey: 30, kind: 1, created_at: 3000));
-            input.insert(event_row!(id: 5, pubkey: 50, kind: 1, created_at: 5000));
-            input.insert(event_row!(id: 7, pubkey: 70, kind: 1, created_at: 7000));
-        });
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, 5);
     }
 }

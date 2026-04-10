@@ -77,17 +77,39 @@ where
 
             let bootstrap_frontier = ts + 1;
             event_cap.downgrade([bootstrap_frontier]);
+
+            while let Ok((event, _ts, diff)) = subscription.try_recv() {
+                if !query.matches_kind(event.kind) {
+                    continue;
+                }
+
+                event_handle.give(
+                    &event_cap[0],
+                    (
+                        EventRow {
+                            id: event.id,
+                            pubkey: event.pubkey,
+                            kind: event.kind,
+                            created_at: event.created_at,
+                            edges: event.tags,
+                        },
+                        bootstrap_frontier,
+                        diff as Diff,
+                    ),
+                );
+            }
+
             bootstrap_handle.give(&bootstrap_cap[0], bootstrap_frontier);
             bootstrap_cap.downgrade(std::iter::empty::<u64>());
 
-            let mut max_seen_ts = 0u64;
+            let mut live_output_ts = bootstrap_frontier;
 
             while let Some((event, ts, diff)) = subscription.recv().await {
                 if !query.matches_kind(event.kind) {
                     continue;
                 }
 
-                max_seen_ts = max_seen_ts.max(ts);
+                let output_ts = live_output_ts.max(ts);
                 let d = diff as Diff;
                 event_handle.give(
                     &event_cap[0],
@@ -99,14 +121,15 @@ where
                             created_at: event.created_at,
                             edges: event.tags,
                         },
-                        ts,
+                        output_ts,
                         d,
                     ),
                 );
 
                 if subscription.is_empty() {
-                    let closed_through = max_seen_ts;
+                    let closed_through = output_ts;
                     let new_frontier = closed_through.saturating_add(1);
+                    live_output_ts = new_frontier;
                     event_cap.downgrade([new_frontier]);
 
                     while probe.with_frontier(|f| f.less_equal(&closed_through)) {

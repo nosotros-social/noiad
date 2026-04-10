@@ -278,101 +278,140 @@ mod tests {
     #[test]
     fn assert_event_assertions() {
         let captured = build_dataflow(|events_input| {
-            events_input.insert(EventRow {
-                id: EVENT_POST1,
-                pubkey: PUBKEY1,
-                created_at: 1000,
-                kind: Kind::TextNote.as_u16(),
-                tags: vec![],
-            });
-            events_input.insert(EventRow {
-                id: EVENT_POST2,
-                pubkey: PUBKEY2,
-                created_at: 1001,
-                kind: Kind::TextNote.as_u16(),
-                tags: vec![],
-            });
-            events_input.insert(EventRow {
-                id: EVENT_POST3,
-                pubkey: PUBKEY3,
-                created_at: 1002,
-                kind: Kind::TextNote.as_u16(),
-                tags: vec![],
-            });
+            events_input.update(
+                EventRow {
+                    id: EVENT_POST1,
+                    pubkey: PUBKEY1,
+                    created_at: 1000,
+                    kind: Kind::TextNote.as_u16(),
+                    tags: vec![],
+                },
+                1 as Diff,
+            );
+            events_input.update(
+                EventRow {
+                    id: EVENT_POST2,
+                    pubkey: PUBKEY2,
+                    created_at: 1001,
+                    kind: Kind::TextNote.as_u16(),
+                    tags: vec![],
+                },
+                1 as Diff,
+            );
+            events_input.update(
+                EventRow {
+                    id: EVENT_POST3,
+                    pubkey: PUBKEY3,
+                    created_at: 1002,
+                    kind: Kind::TextNote.as_u16(),
+                    tags: vec![],
+                },
+                1 as Diff,
+            );
 
             // EVENT_POST1: 3 reactions, 2 comments, 1 quote, 1 repost, 2 zaps (8000 sats)
-            events_input.insert(EventRow {
-                id: 200,
-                pubkey: PUBKEY2,
-                created_at: 2000,
-                kind: Kind::Reaction.as_u16(),
-                tags: vec![EventTag::Mention(EVENT_POST1)],
-            });
-            events_input.insert(EventRow {
-                id: 201,
-                pubkey: PUBKEY3,
-                created_at: 2001,
-                kind: Kind::Reaction.as_u16(),
-                tags: vec![EventTag::Mention(EVENT_POST1)],
-            });
-            events_input.insert(EventRow {
-                id: 202,
-                pubkey: PUBKEY1,
-                created_at: 2002,
-                kind: Kind::Reaction.as_u16(),
-                tags: vec![EventTag::Mention(EVENT_POST1)],
-            });
-            events_input.insert(EventRow {
-                id: 203,
-                pubkey: PUBKEY2,
-                created_at: 2003,
-                kind: Kind::TextNote.as_u16(),
-                tags: vec![EventTag::Reply(EVENT_POST1)],
-            });
-            events_input.insert(EventRow {
-                id: 204,
-                pubkey: PUBKEY3,
-                created_at: 2004,
-                kind: Kind::TextNote.as_u16(),
-                tags: vec![EventTag::RootReply(EVENT_POST1)],
-            });
-            events_input.insert(EventRow {
-                id: 205,
-                pubkey: PUBKEY2,
-                created_at: 2005,
-                kind: Kind::TextNote.as_u16(),
-                tags: vec![EventTag::Quote(EVENT_POST1)],
-            });
-            events_input.insert(EventRow {
-                id: 206,
-                pubkey: PUBKEY3,
-                created_at: 2006,
-                kind: Kind::Repost.as_u16(),
-                tags: vec![EventTag::Mention(EVENT_POST1)],
-            });
-            events_input.insert(EventRow {
-                id: 207,
-                pubkey: PUBKEY_LN,
-                created_at: 2007,
-                kind: Kind::ZapReceipt.as_u16(),
-                tags: vec![EventTag::Mention(EVENT_POST1), EventTag::Bolt11(5000)],
-            });
-            events_input.insert(EventRow {
-                id: 208,
-                pubkey: PUBKEY_LN,
-                created_at: 2008,
-                kind: Kind::ZapReceipt.as_u16(),
-                tags: vec![EventTag::Mention(EVENT_POST1), EventTag::Bolt11(3000)],
-            });
+            events_input.update(
+                EventRow {
+                    id: 200,
+                    pubkey: PUBKEY2,
+                    created_at: 2000,
+                    kind: Kind::Reaction.as_u16(),
+                    tags: vec![EventTag::Mention(EVENT_POST1)],
+                },
+                1 as Diff,
+            );
+            events_input.update(
+                EventRow {
+                    id: 201,
+                    pubkey: PUBKEY3,
+                    created_at: 2001,
+                    kind: Kind::Reaction.as_u16(),
+                    tags: vec![EventTag::Mention(EVENT_POST1)],
+                },
+                1 as Diff,
+            );
+            events_input.update(
+                EventRow {
+                    id: 202,
+                    pubkey: PUBKEY1,
+                    created_at: 2002,
+                    kind: Kind::Reaction.as_u16(),
+                    tags: vec![EventTag::Mention(EVENT_POST1)],
+                },
+                1 as Diff,
+            );
+            events_input.update(
+                EventRow {
+                    id: 203,
+                    pubkey: PUBKEY2,
+                    created_at: 2003,
+                    kind: Kind::TextNote.as_u16(),
+                    tags: vec![EventTag::Reply(EVENT_POST1)],
+                },
+                1 as Diff,
+            );
+            events_input.update(
+                EventRow {
+                    id: 204,
+                    pubkey: PUBKEY3,
+                    created_at: 2004,
+                    kind: Kind::TextNote.as_u16(),
+                    tags: vec![EventTag::RootReply(EVENT_POST1)],
+                },
+                1 as Diff,
+            );
+            events_input.update(
+                EventRow {
+                    id: 205,
+                    pubkey: PUBKEY2,
+                    created_at: 2005,
+                    kind: Kind::TextNote.as_u16(),
+                    tags: vec![EventTag::Quote(EVENT_POST1)],
+                },
+                1 as Diff,
+            );
+            events_input.update(
+                EventRow {
+                    id: 206,
+                    pubkey: PUBKEY3,
+                    created_at: 2006,
+                    kind: Kind::Repost.as_u16(),
+                    tags: vec![EventTag::Mention(EVENT_POST1)],
+                },
+                1 as Diff,
+            );
+            events_input.update(
+                EventRow {
+                    id: 207,
+                    pubkey: PUBKEY_LN,
+                    created_at: 2007,
+                    kind: Kind::ZapReceipt.as_u16(),
+                    tags: vec![EventTag::Mention(EVENT_POST1), EventTag::Bolt11(5000)],
+                },
+                1 as Diff,
+            );
+            events_input.update(
+                EventRow {
+                    id: 208,
+                    pubkey: PUBKEY_LN,
+                    created_at: 2008,
+                    kind: Kind::ZapReceipt.as_u16(),
+                    tags: vec![EventTag::Mention(EVENT_POST1), EventTag::Bolt11(3000)],
+                },
+                1 as Diff,
+            );
 
             // EVENT_POST2: 1 reaction only
-            events_input.insert(EventRow {
-                id: 300,
-                pubkey: PUBKEY1,
-                created_at: 3000,
-                kind: Kind::Reaction.as_u16(),
-                tags: vec![EventTag::Mention(EVENT_POST2)],
-            });
+            events_input.update(
+                EventRow {
+                    id: 300,
+                    pubkey: PUBKEY1,
+                    created_at: 3000,
+                    kind: Kind::Reaction.as_u16(),
+                    tags: vec![EventTag::Mention(EVENT_POST2)],
+                },
+                1 as Diff,
+            );
         });
 
         let rows1 = get_captured_by_event(&captured, EVENT_POST1);

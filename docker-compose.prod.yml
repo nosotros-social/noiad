@@ -1,0 +1,33 @@
+services:
+  core:
+    image: ${CORE_IMAGE:-${NOIAD_ECR_REGISTRY:-AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com}/noiad:core-${TAG:-latest}}
+    command:
+      [
+        "--workers",
+        "${NOIAD_WORKERS:-4}",
+        "--server-addr",
+        "0.0.0.0:5551",
+        "--persist-path",
+        "/app/data/db",
+        "--no-replication"
+      ]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./core/data:/app/data
+    restart: unless-stopped
+
+  relay:
+    image: ${RELAY_IMAGE:-${NOIAD_ECR_REGISTRY:-AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com}/noiad:relay-${TAG:-latest}}
+    depends_on:
+      - core
+    environment:
+      CORE_ADDR: core:5551
+      DB_PATH: /app/data/db
+      PORT: "8889"
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "${RELAY_PORT:-8889}:8889"
+    volumes:
+      - ./core/data:/app/data
+    restart: unless-stopped

@@ -22,9 +22,10 @@ const CHECKPOINT_KEY: &[u8] = b"checkpoint";
 
 #[derive(Debug)]
 pub struct PersistStore {
-    pub event_shards: Vec<RocksDb>,
+    pub interner_db: RocksDb,
     pub db: RocksDb,
     pub interner: Interner,
+    pub(crate) event_write_lock: Mutex<()>,
     subscribers: Mutex<HashMap<WorkerKey, mpsc::UnboundedSender<PersistUpdate>>>,
 }
 
@@ -38,11 +39,21 @@ fn db_options() -> Options {
     options
 }
 
-fn open_main_db(path: impl AsRef<Path>) -> Result<RocksDb> {
+pub fn event_shard_id(event_id: u32) -> usize {
+    (event_id as usize) % NUM_EVENT_SHARDS
+}
+
+pub fn event_record_key(event_id: u32) -> [u8; 5] {
+    let mut key = [0u8; 5];
+    key[0] = event_shard_id(event_id) as u8;
+    key[1..].copy_from_slice(&event_id.to_be_bytes());
+    key
+}
+
+fn open_event_db(path: impl AsRef<Path>) -> Result<RocksDb> {
     let options = db_options();
     let cfs = [
-        schema::INTERN_FORWARD_CF,
-        schema::INTERN_REVERSE_CF,
+        schema::EVENTS_CF,
         schema::EVENT_RAW_CF,
         schema::REPLACEABLE_CF,
         schema::ADDRESSABLE_CF,
@@ -56,9 +67,9 @@ fn open_main_db(path: impl AsRef<Path>) -> Result<RocksDb> {
     Ok(db)
 }
 
-fn open_event_shard(path: impl AsRef<Path>) -> Result<RocksDb> {
+fn open_interner_db(path: impl AsRef<Path>) -> Result<RocksDb> {
     let options = db_options();
-    let cfs = [schema::EVENTS_CF]
+    let cfs = [schema::INTERN_FORWARD_CF, schema::INTERN_REVERSE_CF]
         .into_iter()
         .map(|name| ColumnFamilyDescriptor::new(name, options.clone()))
         .collect::<Vec<_>>();
@@ -71,29 +82,33 @@ impl PersistStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let root = path.as_ref();
         std::fs::create_dir_all(root)?;
-        std::fs::create_dir_all(root.join("event_shards"))?;
 
-        let db = open_main_db(root.join("main"))?;
-        let event_shards = (0..NUM_EVENT_SHARDS)
-            .map(|shard_id| {
-                open_event_shard(root.join("event_shards").join(format!("{shard_id:02}")))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let interner = Interner::new(&db)?;
+        let interner_db = open_interner_db(root.join("interner"))?;
+        let db = open_event_db(root.join("events"))?;
+        let interner = Interner::new(&interner_db)?;
         Ok(PersistStore {
-            event_shards,
+            interner_db,
             db,
             interner,
+            event_write_lock: Mutex::new(()),
             subscribers: Mutex::new(HashMap::new()),
         })
     }
 
-    pub fn shard_for_event_id(&self, event_id: u32) -> usize {
-        (event_id as usize) % self.event_shards.len()
+    pub fn intern(&self, bytes: &[u8]) -> Result<u32> {
+        self.interner.intern(&self.interner_db, bytes)
     }
 
-    pub fn event_db(&self, event_id: u32) -> &RocksDb {
-        &self.event_shards[self.shard_for_event_id(event_id)]
+    pub fn intern_get(&self, bytes: &[u8]) -> Result<Option<u32>> {
+        self.interner.get(&self.interner_db, bytes)
+    }
+
+    pub fn resolve_node(&self, node: u32) -> Result<Option<Vec<u8>>> {
+        self.interner.resolve(&self.interner_db, node)
+    }
+
+    pub fn shard_for_event_id(&self, event_id: u32) -> usize {
+        event_shard_id(event_id)
     }
 
     pub fn save_checkpoint(&self, checkpoint: u64) -> Result<()> {
@@ -153,15 +168,24 @@ mod tests {
     fn assert_store_column_families() {
         let store = TestStore::default();
 
-        assert!(store.db.cf_handle(schema::INTERN_FORWARD_CF).is_some());
-        assert!(store.db.cf_handle(schema::INTERN_REVERSE_CF).is_some());
+        assert!(
+            store
+                .interner_db
+                .cf_handle(schema::INTERN_FORWARD_CF)
+                .is_some()
+        );
+        assert!(
+            store
+                .interner_db
+                .cf_handle(schema::INTERN_REVERSE_CF)
+                .is_some()
+        );
+        assert!(store.db.cf_handle(schema::INTERN_FORWARD_CF).is_none());
+        assert!(store.db.cf_handle(schema::INTERN_REVERSE_CF).is_none());
         assert!(store.db.cf_handle(schema::EVENT_RAW_CF).is_some());
+        assert!(store.db.cf_handle(schema::EVENTS_CF).is_some());
         assert!(store.db.cf_handle(schema::REPLACEABLE_CF).is_some());
         assert!(store.db.cf_handle(schema::ADDRESSABLE_CF).is_some());
         assert!(store.db.cf_handle(schema::CHECKPOINTS_CF).is_some());
-        assert_eq!(store.event_shards.len(), NUM_EVENT_SHARDS);
-        for shard in &store.event_shards {
-            assert!(shard.cf_handle(schema::EVENTS_CF).is_some());
-        }
     }
 }

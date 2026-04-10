@@ -12,13 +12,20 @@ mod replication;
 mod snapshot;
 pub mod utils;
 
-pub fn render<G>(scope: &G, config: DataflowConfig) -> StreamCore<G, Vec<()>>
+pub fn render<G>(
+    scope: &G,
+    config: DataflowConfig,
+) -> StreamCore<G, Vec<()>>
 where
     G: Scope<Timestamp = u64>,
 {
     let (snapshot_updates, lsn_stream) = snapshot(scope, config.clone());
-    let replication_updates = replication(scope, &lsn_stream);
-    let updates = snapshot_updates.concat(&replication_updates);
 
-    persist_sink(scope, config.clone(), &updates)
+    if config.no_replication {
+        persist_sink(scope, config.clone(), &snapshot_updates)
+    } else {
+        let replication_updates = replication(scope, &lsn_stream);
+        let updates = snapshot_updates.concat(&replication_updates);
+        persist_sink(scope, config.clone(), &updates)
+    }
 }

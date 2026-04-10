@@ -1,12 +1,7 @@
+use rkyv::{Archive, Deserialize as RDeserialize, Serialize as RSerialize};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    tags::EventTag,
-    types::{KindU16, Node},
-};
-
-pub type TagKey = (EdgeLabel, Node);
-pub type KindEdgeLabel = (KindU16, Node, Node, EdgeLabel);
+use crate::types::Node;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum EdgeLabel {
@@ -23,34 +18,48 @@ pub enum EdgeLabel {
     DTag,
 }
 
-pub struct EventEdges {
-    pub kind: u16,
-    pub from: Node,
-    pub tags: std::vec::IntoIter<EventTag>,
+#[derive(
+    Archive,
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    RSerialize,
+    RDeserialize,
+    PartialEq,
+    Eq,
+    Ord,
+    PartialOrd,
+    Hash,
+)]
+pub enum Edge {
+    RootReply(Node),
+    Reply(Node),
+    Mention(Node),
+    Pubkey(Node),
+    PubkeyUpper(Node),
+    Quote(Node),
+    QuoteAddress(Node),
+    Address(Node),
+    Topic(Node),
+    Bolt11(u64),
+    DTag(Node),
 }
 
-impl Iterator for EventEdges {
-    type Item = (u16, Node, Node, EdgeLabel);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let tag = self.tags.next()?;
-
-            let (to, label) = match tag {
-                EventTag::RootReply(target) => (target, EdgeLabel::RootReply),
-                EventTag::Reply(target) => (target, EdgeLabel::Reply),
-                EventTag::Mention(target) => (target, EdgeLabel::Mention),
-                EventTag::Pubkey(target) => (target, EdgeLabel::Pubkey),
-                EventTag::PubkeyUpper(target) => (target, EdgeLabel::PubkeyUpper),
-                EventTag::Quote(target) => (target, EdgeLabel::Quote),
-                EventTag::QuoteAddress { pubkey, .. } => (pubkey, EdgeLabel::QuoteAddress),
-                EventTag::Address { pubkey, .. } => (pubkey, EdgeLabel::Address),
-                EventTag::Topic(target) => (target, EdgeLabel::Topic),
-                EventTag::DTag(target) => (target, EdgeLabel::DTag),
-                EventTag::Bolt11(_) => continue,
-            };
-
-            return Some((self.kind, self.from, to, label));
+impl Edge {
+    pub fn to_edge_key(&self) -> Option<(EdgeLabel, Node)> {
+        match self {
+            Edge::RootReply(n) => Some((EdgeLabel::RootReply, *n)),
+            Edge::Reply(n) => Some((EdgeLabel::Reply, *n)),
+            Edge::Mention(n) => Some((EdgeLabel::Mention, *n)),
+            Edge::Pubkey(n) => Some((EdgeLabel::Pubkey, *n)),
+            Edge::PubkeyUpper(n) => Some((EdgeLabel::PubkeyUpper, *n)),
+            Edge::Quote(n) => Some((EdgeLabel::Quote, *n)),
+            Edge::QuoteAddress(pubkey) => Some((EdgeLabel::QuoteAddress, *pubkey)),
+            Edge::Address(pubkey) => Some((EdgeLabel::Address, *pubkey)),
+            Edge::Topic(n) => Some((EdgeLabel::Topic, *n)),
+            Edge::DTag(n) => Some((EdgeLabel::DTag, *n)),
+            Edge::Bolt11(_) => None,
         }
     }
 }

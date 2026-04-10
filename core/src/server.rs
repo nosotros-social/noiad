@@ -9,11 +9,13 @@ use transport::{
     server::{Request, Response},
 };
 
+use crate::query::filter::effective_query_limit;
+
 #[derive(Debug)]
 pub struct Handler {
     pub req_txs: Arc<Vec<Sender<Request>>>,
     pub resp_rx: mpsc::UnboundedReceiver<Response>,
-    request_limits: HashMap<ReqId, Option<usize>>,
+    request_limits: HashMap<ReqId, usize>,
     recv_task: tokio::task::JoinHandle<()>,
 }
 
@@ -113,10 +115,13 @@ impl Handler {
 #[async_trait]
 impl ConnectionHandler for Handler {
     async fn send(&mut self, request: &Request) -> Result<()> {
+        let effective_limit = effective_query_limit(request.filter.limit);
         self.request_limits
-            .insert(request.request_id, request.filter.limit);
+            .insert(request.request_id, effective_limit);
 
         // Broadcast request to all workers
+        let mut request = request.clone();
+        request.filter.limit = Some(effective_limit);
         for tx in self.req_txs.iter() {
             tx.send(request.clone())?;
         }
@@ -132,7 +137,7 @@ impl ConnectionHandler for Handler {
 
         match &mut response {
             Response::Result { request_id, events } => {
-                if let Some(Some(limit)) = self.request_limits.get(request_id) {
+                if let Some(limit) = self.request_limits.get(request_id) {
                     events.truncate(*limit);
                 }
             }
@@ -320,6 +325,52 @@ mod tests {
                         || events.contains(&event2)
                         || events.contains(&event3)
                 );
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+
+        match handler.recv().await.unwrap() {
+            Response::Eose { request_id: got_id } => assert_eq!(got_id, request_id),
+            other => panic!("expected Eose, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn assert_server_applies_default_max_limit_after_merge() {
+        let (mut handler, workers) = make_handler(2);
+        let keys = Keys::generate();
+
+        let request_id = 8;
+        handler
+            .send(&Request {
+                request_id,
+                filter: nostr_sdk::Filter::new().kind(nostr_sdk::Kind::TextNote),
+            })
+            .await
+            .unwrap();
+
+        for w in workers.iter() {
+            let request = w.recv_request();
+            assert_eq!(request.request_id, request_id);
+            assert_eq!(
+                request.filter.limit,
+                Some(crate::query::filter::MAX_QUERY_LIMIT)
+            );
+        }
+
+        let event = make_test_event(keys);
+        workers[0].send_results(request_id, vec![event.clone(); 400]);
+        workers[0].send_eose(request_id);
+        workers[1].send_results(request_id, vec![event; 400]);
+        workers[1].send_eose(request_id);
+
+        match handler.recv().await.unwrap() {
+            Response::Result {
+                request_id: got_id,
+                events,
+            } => {
+                assert_eq!(got_id, request_id);
+                assert_eq!(events.len(), crate::query::filter::MAX_QUERY_LIMIT);
             }
             other => panic!("expected Result, got {other:?}"),
         }

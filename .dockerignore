@@ -1,0 +1,11 @@
+target
+.git
+.gitignore
+.env
+.env.*
+core/data
+core/models
+.DS_Store
+.uv-cache
+old
+tui

@@ -1,9 +1,11 @@
 use rkyv::{access, deserialize, rancor};
-use rocksdb::{DBIteratorWithThreadMode, DBWithThreadMode, MultiThreaded, ReadOptions};
+use rocksdb::{
+    DBIteratorWithThreadMode, DBWithThreadMode, Direction, IteratorMode, MultiThreaded, ReadOptions,
+};
 use types::{edges::Edge, event::EventRow};
 
 use crate::{
-    db::PersistStore,
+    db::{NUM_EVENT_SHARDS, PersistStore},
     event::ArchivedEventRecord,
     query::PersistQuery,
     schema::{EVENTS_CF, cf},
@@ -11,6 +13,7 @@ use crate::{
 
 pub struct EventIterator<'a> {
     iters: Vec<DBIteratorWithThreadMode<'a, DBWithThreadMode<MultiThreaded>>>,
+    shard_prefixes: Vec<u8>,
     current_iter: usize,
     query: PersistQuery,
 }
@@ -29,13 +32,19 @@ impl<'a> Iterator for EventIterator<'a> {
                 }
             };
 
-            let (_, value_bytes) = match item {
+            let (key, value_bytes) = match item {
                 Ok(v) => v,
                 Err(err) => {
                     eprintln!("rocksdb iter err: {err}");
                     continue;
                 }
             };
+
+            let expected_shard = *self.shard_prefixes.get(self.current_iter)?;
+            if key.first().copied() != Some(expected_shard) {
+                self.current_iter += 1;
+                continue;
+            }
 
             let archived = match access::<ArchivedEventRecord, rancor::Error>(&value_bytes) {
                 Ok(v) => v,
@@ -104,21 +113,28 @@ impl PersistStore {
         worker_id: usize,
         workers: usize,
     ) -> EventIterator<'_> {
-        let iters = self
-            .event_shards
+        let cf_events = cf!(self.db, EVENTS_CF);
+        let shard_prefixes = (0..NUM_EVENT_SHARDS)
+            .filter(|shard_idx| shard_idx % workers == worker_id)
+            .map(|shard_idx| shard_idx as u8)
+            .collect::<Vec<_>>();
+        let iters = shard_prefixes
             .iter()
-            .enumerate()
-            .filter(|(shard_idx, _)| shard_idx % workers == worker_id)
-            .map(|(_, db)| db)
-            .map(|db| {
-                let cf_events = cf!(db, EVENTS_CF);
+            .map(|shard_idx| {
+                let start_key = [*shard_idx];
                 let mut readopts = ReadOptions::default();
                 readopts.fill_cache(false);
-                db.iterator_cf_opt(&cf_events, readopts, rocksdb::IteratorMode::Start)
+                self.db.iterator_cf_opt(
+                    &cf_events,
+                    readopts,
+                    IteratorMode::From(&start_key, Direction::Forward),
+                )
             })
             .collect();
+
         EventIterator {
             iters,
+            shard_prefixes,
             current_iter: 0,
             query,
         }
@@ -127,6 +143,8 @@ impl PersistStore {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use types::event_row;
 
     use super::*;
@@ -185,6 +203,33 @@ mod tests {
         let ids: Vec<_> = events.iter().map(|e| e.id).collect();
 
         assert_eq!(ids, vec![e1.id, e2.id]);
+    }
+
+    #[test]
+    fn assert_iter_events_for_worker_partitions_shard_prefixes() {
+        let store = TestStore::default();
+        let mut all_ids = HashSet::new();
+
+        for idx in 1..=128u8 {
+            let event = store
+                .insert_event(&event_raw!(id: [idx; 32], kind: 1))
+                .unwrap()
+                .unwrap();
+            all_ids.insert(event.id);
+        }
+
+        let mut worker_ids = HashSet::new();
+        for worker_id in 0..4 {
+            let ids: HashSet<_> = store
+                .iter_events_for_worker(PersistQuery::default(), worker_id, 4)
+                .map(|event| event.id)
+                .collect();
+            assert!(!ids.is_empty());
+            assert!(worker_ids.is_disjoint(&ids));
+            worker_ids.extend(ids);
+        }
+
+        assert_eq!(worker_ids, all_ids);
     }
 
     #[test]

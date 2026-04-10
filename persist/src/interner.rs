@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn assert_interner() {
         let store = TestStore::default();
-        let db = &store.db;
+        let db = &store.interner_db;
         let interner = &store.interner;
 
         let pubkey1 = [1u8; 32];
@@ -215,7 +215,7 @@ mod tests {
         assert_eq!(symbol4, 4);
         assert_eq!(symbol3_again, 3);
         assert_eq!(store.interner.next_symbol.load(Ordering::Relaxed), 5);
-        assert_eq!(Interner::find_max_symbol(&store.db).unwrap(), 4);
+        assert_eq!(Interner::find_max_symbol(&store.interner_db).unwrap(), 4);
 
         assert_eq!(
             interner.resolve(db, symbol1).unwrap().unwrap(),
@@ -244,7 +244,7 @@ mod tests {
                 thread::spawn(move || {
                     let mut bytes = [0u8; 32];
                     bytes[0] = i as u8;
-                    store.interner.intern(&store.db, &bytes).unwrap()
+                    store.intern(&bytes).unwrap()
                 })
             })
             .collect();
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn assert_batched_intern_same_bytes() {
         let store = TestStore::default();
-        let mut batch = InternBatch::new(&store.db, &store.interner);
+        let mut batch = InternBatch::new(&store.interner_db, &store.interner);
 
         let bytes_a = [1u8; 32];
         let bytes_b = [2u8; 32];
@@ -276,20 +276,12 @@ mod tests {
         assert_ne!(symbol_a1, symbol_b1);
 
         store
-            .db
+            .interner_db
             .write(std::mem::take(&mut batch.write_batch))
             .unwrap();
 
-        let resolved_a = store
-            .interner
-            .resolve(&store.db, symbol_a1)
-            .unwrap()
-            .unwrap();
-        let resolved_b = store
-            .interner
-            .resolve(&store.db, symbol_b1)
-            .unwrap()
-            .unwrap();
+        let resolved_a = store.resolve_node(symbol_a1).unwrap().unwrap();
+        let resolved_b = store.resolve_node(symbol_b1).unwrap().unwrap();
 
         assert_eq!(resolved_a, bytes_a.to_vec());
         assert_eq!(resolved_b, bytes_b.to_vec());
@@ -301,8 +293,8 @@ mod tests {
         let bytes = [9u8; 32];
 
         // Simulate two concurrent writers
-        let mut batch_a = InternBatch::new(&store.db, &store.interner);
-        let mut batch_b = InternBatch::new(&store.db, &store.interner);
+        let mut batch_a = InternBatch::new(&store.interner_db, &store.interner);
+        let mut batch_b = InternBatch::new(&store.interner_db, &store.interner);
 
         let symbol_a = store.interner.intern_batch(&mut batch_a, &bytes).unwrap();
         let symbol_b = store.interner.intern_batch(&mut batch_b, &bytes).unwrap();
@@ -310,22 +302,18 @@ mod tests {
         assert_eq!(symbol_a, symbol_b);
 
         store
-            .db
+            .interner_db
             .write(std::mem::take(&mut batch_a.write_batch))
             .unwrap();
         store
-            .db
+            .interner_db
             .write(std::mem::take(&mut batch_b.write_batch))
             .unwrap();
 
-        let symbol = store.interner.get(&store.db, &bytes).unwrap().unwrap();
+        let symbol = store.intern_get(&bytes).unwrap().unwrap();
         assert_eq!(symbol, symbol_a);
         assert_eq!(
-            store
-                .interner
-                .resolve(&store.db, symbol_a)
-                .unwrap()
-                .unwrap(),
+            store.resolve_node(symbol_a).unwrap().unwrap(),
             bytes.to_vec()
         );
     }

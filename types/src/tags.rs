@@ -1,51 +1,38 @@
-use rkyv::{Archive, Deserialize as RDeserialize, Serialize as RSerialize};
 use serde::{Deserialize, Serialize};
 
-use crate::{edges::EdgeLabel, types::Node};
+use crate::{edges::Edge, types::Node};
 
-#[derive(
-    Archive,
-    Debug,
-    Clone,
-    Serialize,
-    Deserialize,
-    RSerialize,
-    RDeserialize,
-    PartialEq,
-    Eq,
-    Ord,
-    PartialOrd,
-    Hash,
-)]
-pub enum EventTag {
-    RootReply(u32),
-    Reply(u32),
-    Mention(u32),
-    Pubkey(u32),
-    PubkeyUpper(u32),
-    Quote(u32),
-    QuoteAddress { pubkey: u32, address: u32 },
-    Address { pubkey: u32, address: u32 },
-    Topic(u32),
-    Bolt11(u64),
-    DTag(u32),
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum TagLabel {
+    Event,
+    EventUpper,
+    Pubkey,
+    PubkeyUpper,
+    Address,
+    AddressUpper,
+    Quote,
+    Topic,
+    DTag,
 }
 
-impl EventTag {
-    pub fn to_edge(&self) -> Option<(EdgeLabel, Node)> {
-        let (label, node) = match self {
-            EventTag::RootReply(n) => (EdgeLabel::RootReply, *n),
-            EventTag::Reply(n) => (EdgeLabel::Reply, *n),
-            EventTag::Mention(n) => (EdgeLabel::Mention, *n),
-            EventTag::Pubkey(n) => (EdgeLabel::Pubkey, *n),
-            EventTag::PubkeyUpper(n) => (EdgeLabel::PubkeyUpper, *n),
-            EventTag::Quote(n) => (EdgeLabel::Quote, *n),
-            EventTag::QuoteAddress { pubkey, .. } => (EdgeLabel::QuoteAddress, *pubkey),
-            EventTag::Address { pubkey, .. } => (EdgeLabel::Address, *pubkey),
-            EventTag::Topic(n) => (EdgeLabel::Topic, *n),
-            EventTag::DTag(n) => (EdgeLabel::DTag, *n),
-            EventTag::Bolt11(_) => return None,
-        };
-        Some((label, node))
+pub type TagKey = (TagLabel, Node);
+
+impl TryFrom<Edge> for TagKey {
+    type Error = ();
+
+    fn try_from(value: Edge) -> Result<Self, Self::Error> {
+        match value {
+            Edge::RootReply(n) => Ok((TagLabel::Event, n)),
+            Edge::Reply(n) => Ok((TagLabel::Event, n)),
+            Edge::Mention(n) => Ok((TagLabel::Event, n)),
+            Edge::Pubkey(n) => Ok((TagLabel::Pubkey, n)),
+            Edge::PubkeyUpper(n) => Ok((TagLabel::PubkeyUpper, n)),
+            Edge::Quote(n) => Ok((TagLabel::Quote, n)),
+            Edge::QuoteAddress(n) => Ok((TagLabel::Quote, n)),
+            Edge::Address(n) => Ok((TagLabel::Address, n)),
+            Edge::Topic(n) => Ok((TagLabel::Topic, n)),
+            Edge::DTag(n) => Ok((TagLabel::DTag, n)),
+            Edge::Bolt11(_) => Err(()),
+        }
     }
 }

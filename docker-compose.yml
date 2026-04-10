@@ -1,0 +1,32 @@
+services:
+  core:
+    build:
+      context: .
+      dockerfile: Dockerfile.core
+    image: noiad-core:latest
+    command: ["--workers", "4", "--server-addr", "0.0.0.0:5551"]
+    environment:
+      RUST_LOG: info
+    ports:
+      - "5551:5551"
+    volumes:
+      - ./core/data:/app/data
+    restart: unless-stopped
+
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile.relay
+    image: noiad-relay:latest
+    depends_on:
+      - core
+    environment:
+      CORE_ADDR: core:5551
+      DB_PATH: /app/data/db
+      PORT: "8889"
+      RUST_LOG: info
+    ports:
+      - "8889:8889"
+    volumes:
+      - ./core/data:/app/data
+    restart: unless-stopped

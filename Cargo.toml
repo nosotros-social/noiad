@@ -4,6 +4,7 @@ members = [
     'relay',
     "nostrpg",
     "persist",
+    "search",
     "types",
     "transport"
 ]
@@ -11,3 +12,8 @@ default-members = ['relay']
 
 [workspace.dependencies]
 
+[patch.crates-io]
+nostr = { path = "/Users/cesar/Develop/repos/nostr/crates/nostr" }
+nostr-database = { path = "/Users/cesar/Develop/repos/nostr/database/nostr-database" }
+nostr-sdk = { path = "/Users/cesar/Develop/repos/nostr/crates/nostr-sdk" }
+nostr-relay-builder = { path = "/Users/cesar/Develop/repos/nostr/crates/nostr-relay-builder" }
